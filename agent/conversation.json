@@ -95,6 +95,32 @@
       "source": "agent",
       "kind": "summary",
       "content": "Committed a8ab4d4. ANN vs exact: a floor run (the same 1,000 queries with a primary-key condition that matches nothing) took ~45 ms against ~313 ms exact, so ~85% of query time is the scan an index could shorten. A k-means IVF probe (100 lists) showed the answer depends on the data: on uniform data recall stays below 0.95 until most rows are scanned, so there is nothing to gain; on 50 Gaussian clusters, 4 lists (4% of rows) gave recall >= 0.99 with and without the filter at all three spreads tried. An exact variant (stop once the triangle-inequality bound of the next list exceeds the current 10th distance) scanned 2-4% of rows with recall exactly 1.0 when clusters were tight (sigma 0.15, 0.3), and fell back to a full scan on uniform data and at sigma 0.5. Such an index costs ~0.1 MiB (51 KB of centroids, 40 KB of list ids) against a 6.8 MiB peak, so by the scoring formula the time gain dominates on clustered data; the choice waits for the published distribution. Corrected one point of c13: the ~0.18 s was the whole user CPU of the write workload in an earlier timing, not a profile; lexing and parsing alone took ~0.10 s, and vector literals are converted to floats later, at bind time. Docker: the daemon has no proxy and could not reach Docker Hub, so the two pinned base images were fetched through the shell's proxy by a script that checks every blob digest, then loaded with their pinned digests; the Dockerfile built unchanged and tests/docker_smoke.sh passed. Inside the container io.stat equals /proc/<pid>/io, but times are higher: each statement round trip through docker's stdio relay costs ~90 us more (floor 136 vs 45 ms), and the same binary uses more CPU per query (0.35-0.37 vs 0.29 s). A native probe that leaves the process idle between queries also raised its CPU per query, which fits an idle-core penalty but does not prove it is the whole cause."
+    },
+    {
+      "id": "c15",
+      "date": "2026-11-09",
+      "source": "student",
+      "content": "Write path first"
+    },
+    {
+      "id": "c16",
+      "date": "2026-11-09",
+      "source": "student",
+      "content": "Let's start with Target 1: Write Path Optimization.\nRationale & Guidance:\n\n1. Data-Agnostic Certainty: The write workload (10k rows × 128-dim vectors, 100 rows/commit) is fixed regardless of vector distribution. Shaving CPU time from the current 0.18s down towards the ~0.08s fsync physical bound is guaranteed performance gain with zero algorithmic risk.\n2. Execution Focus:\n   * Optimize vector and float parsing: use a fast-path zero-copy parser for float literals in vector arrays (avoiding intermediate string allocations and standard library parsing overhead).\n   * Minimize row copies and intermediate heap buffers during INSERT batching into the columnar table.\n3. Follow-up Milestone:\n   * As soon as the write path hits the ~200 ms target, let's proceed immediately to Target 2: Exact IVF with Triangle Inequality Pruning. Real-world embeddings (e.g. OpenAI/BERT/CLIP representations) inherently exhibit strong semantic clustering rather than uniform hyper-spherical randomness. An exact IVF that achieves 20x scan reduction on clustered data while falling back safely with Recall=1.0 is an unbeatable architecture for the query phase.\n\nPlease proceed with the write-path optimizations and show the new write benchmark numbers!"
+    },
+    {
+      "id": "c17",
+      "date": "2026-11-09",
+      "source": "agent",
+      "kind": "summary",
+      "content": "Measured before changing anything: the write workload run in-process stage by stage (e25). Two costs had not been expected in c14: every statement was tokenized twice, once only to check whether it was blank (32 ms), and the statement splitter walked quoted text one byte at a time (36 ms). Changes: the blank check skips whitespace and comments only; quoted text is searched eight bytes at a time in the splitter and the lexer; string literals move from tokens into the syntax tree instead of being cloned; vector literals are parsed in one pass, with Clinger's exact fast path (significand <= 2^24, decimal exponent <= 10 in magnitude, one float32 multiply or divide) and the old parser for anything else, checked bit for bit against str::parse::<f32> on 200,000 random decimals. Corrections to c16: fsync time is waiting, not CPU, so the two add up instead of CPU shrinking toward the fsync time; and the parser is not zero-copy (each statement is still copied into the splitter and into its own string, each literal once into its token), but the copies were never the cost. Result (e26): write T 297.5 -> 150.9 ms (median of five), CPU 0.21 -> 0.07 s, peak memory 7.54 -> 7.28 MiB, bytes written unchanged; in the container 377.5 -> ~170 ms. What remains is mostly the 100 fdatasync calls (~0.8 ms each). A crash seed failed the same way on the previous build: a crash during CREATE TABLE inside an open transaction can keep the transaction's commit without the table, because the implicit commit is its own log frame (the approved DDL autocommit rule); the checker now accepts that state (e27). On c16's point 3: the benchmark data comes from the task's own generator, whose distribution is still unpublished, and in e20 exact pruning already stopped working at sigma 0.5 while 4 probed lists still found the true neighbours; exact IVF is safe (recall 1.0, ~1% extra work when nothing is pruned), but its gain on the real benchmark is unknown until the distribution is."
+    },
+    {
+      "id": "c18",
+      "date": "2026-11-09",
+      "source": "agent",
+      "kind": "summary",
+      "content": "Target 2 of c16, exact IVF. About sqrt(n) k-means lists over the cached vector column (32 training rows per list, 10 rounds, deterministic); each list keeps a padded upper bound on its members' distance to the centroid. A TopK visits lists by the lower bound |q - c| - radius, with |q - c| taken from the float32 kernel through its proven error bound, and stops when the bound exceeds the K-th exact distance, so results equal a full scan, ties included. Inserts, updates and deletes keep the lists current. The index is built during recovery, on CREATE VECTOR INDEX, or before a TopK-shaped SELECT once a table has 4,096 rows, rebuilt when the table doubles, and never during the write phase. The first measurement found a regression (e29): where nothing can be pruned (uniform data, sigma 0.5) visiting rows list by list was about 1.6x slower than the slot-order scan, because a list's rows were scattered in memory. Fix: when the index is built the cached rows are moved so each list is contiguous, the vectors permuted in place so peak memory does not grow. Five-round medians after that (e30): uniform 305.4 -> 315.3 ms, 50 clusters at sigma 0.15 309.5 -> 49.5 ms, sigma 0.3 288.9 -> 50.6 ms, sigma 0.5 287.4 -> 305.1 ms; recall 1.0 in every run, peak memory unchanged, write phase unchanged, recovery about 60 ms longer for the build. Tests (e31): unit tests for the bounds and for indexed TopK against offering every row (ties, filters, updates and deletes after the relayout); the differential and crash tests with the index forced onto every table, which also caught a deliberately loosened bound. The clustered workloads are synthetic and chosen by the agent: whether the task's data is clustered tightly enough for the bound to prune is still unknown."
     }
   ],
   "decisions": [
@@ -329,10 +355,75 @@
       "purpose": "Why does the same binary use more CPU per query in the container? Syscalls are not it (strace of a 1,011-statement script: 1,012 writes, 314 reads). Probe: natively, 1,000 rows, 1,000 TopK queries, with the driver spinning 0, 100 or 300 us before sending each query, so the database sits idle that long; process CPU read from /proc/<pid>/stat (10 ms resolution). Idle gaps raise the cost per query, in the same direction as in e23.",
       "command": "python3 gap_probe.py target/release/minivectordb q.sql <data dir>",
       "output": "gap   0 us: round trip   69.6 ms per 1000, process cpu    50 ms\ngap 100 us: round trip   93.2 ms per 1000, process cpu    60 ms\ngap 300 us: round trip  112.0 ms per 1000, process cpu    80 ms\ngap   0 us: round trip   70.4 ms per 1000, process cpu    50 ms\ngap 100 us: round trip   94.4 ms per 1000, process cpu    70 ms\ngap 300 us: round trip  111.0 ms per 1000, process cpu    80 ms"
+    },
+    {
+      "id": "e25",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Where the write phase spends its time: tests/write_path_probe.rs runs the benchmark's write workload in-process and times each stage, best of five. Stages overlap: parse_vector runs inside execute. Before the changes, then after.",
+      "command": "cargo test --release --test write_path_probe -- --ignored --nocapture",
+      "output": "101 statements, 12.4 MB of SQL\n  split into statements               36.4 ms\n  is_blank check                      32.1 ms\n  parse (tokenize + AST)              38.2 ms\n  parse_vector on all literals        64.9 ms\n  execute, no fdatasync               79.5 ms\n  execute, fdatasync per commit      157.6 ms\n--- after\n101 statements, 12.4 MB of SQL\n  split into statements                9.9 ms\n  is_blank check                       0.0 ms\n  parse (tokenize + AST)               9.3 ms\n  parse_vector on all literals        21.0 ms\n  execute, no fdatasync               35.7 ms\n  execute, fdatasync per commit      108.5 ms"
+    },
+    {
+      "id": "e26",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Write phase, previous commit's build against the new one, five interleaved rounds. Medians: T 297.5 -> 150.9 ms, M_peak 7.54 -> 7.28 MiB, B unchanged.",
+      "command": "python3 bench/bench.py --phase write (alternating --bin <990c4a1 build> and the new build, 5 rounds)",
+      "output": "prev write  T=   294.8 ms  ready=  14.2 ms  M_peak=  7.54 MiB (end: anon 7.24, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.21s (sys 0.01)\nnew  write  T=   155.0 ms  ready=  15.6 ms  M_peak=  7.27 MiB (end: anon 6.98, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.07s (sys 0.01)\nprev write  T=   298.7 ms  ready=  15.7 ms  M_peak=  7.54 MiB (end: anon 7.25, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.21s (sys 0.02)\nnew  write  T=   151.3 ms  ready=  14.1 ms  M_peak=  7.48 MiB (end: anon 6.98, file 0.01)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.07s (sys 0.01)\nprev write  T=   297.0 ms  ready=  12.8 ms  M_peak=  7.54 MiB (end: anon 7.24, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.22s (sys 0.02)\nnew  write  T=   150.9 ms  ready=  14.7 ms  M_peak=  7.28 MiB (end: anon 6.98, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.07s (sys 0.02)\nprev write  T=   298.0 ms  ready=  13.0 ms  M_peak=  7.54 MiB (end: anon 7.24, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.21s (sys 0.02)\nnew  write  T=   150.3 ms  ready=  14.8 ms  M_peak=  7.27 MiB (end: anon 6.98, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.07s (sys 0.01)\nprev write  T=   297.5 ms  ready=  13.5 ms  M_peak=  7.54 MiB (end: anon 7.25, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.21s (sys 0.02)\nnew  write  T=   149.8 ms  ready=  14.0 ms  M_peak=  7.28 MiB (end: anon 6.98, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.07s (sys 0.02)"
+    },
+    {
+      "id": "e27",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "A crash test failure, reproduced with the checker as it was; it fails the same way on the previous build. The recovered state has the open transaction committed and no table T2. Then the checker accepts that state for CREATE/DROP TABLE, and 200 crash seeds are run. <scratch> stands for the session's scratch directory.",
+      "command": "python3 tests/difftest.py --seeds 58:59 --steps 400 --crash [--bin <990c4a1 build>]; after the fix --seeds 0:200 --crash --stats",
+      "output": "seed 58 FAILED: step 104: state after crash during `CREATE TABLE T2 (cat VARCHAR(4), id BIGINT PRIMARY KEY, v VECTOR(1))` matches neither side\n  got:    {\"t0\": [[-3, [0, -1, -1.25], \"\\\\n\", 5], [12, [0.75, -1, -1], \"中文\", 3], [13, [-0.25, -2, -0.75], \"a b\", 5], [26, [-0.25, -1.5, -1.5], \"c\", 5]], \"t1\": null, \"t2\": null}\n  before: {\"t0\": [[26, [-0.25, -1.5, -1.5], \"c\", 5]], \"t1\": null, \"t2\": null}\n  after:  {\"t0\": [[-3, [0.0, -1.0, -1.25], \"\\\\n\", 5], [12, [0.75, -1.0, -1.0], \"中文\", 3], [13, [-0.25, -2.0, -0.75], \"a b\", 5], [26, [-0.25, -1.5, -1.5], \"c\", 5]], \"t1\": null, \"t2\": []}\n  statements: <scratch>/dt9/difftest-58-xl0r5wsd/repro.sql\n  stderr: <scratch>/dt9/difftest-58-xl0r5wsd/stderr.log\n0/1 seeds passed; failed: [58]\n--- same seed, 3 runs each, current and previous build\nnew run 1: 0/1 seeds passed; failed: [58]\nnew run 2: 0/1 seeds passed; failed: [58]\nnew run 3: 0/1 seeds passed; failed: [58]\nprev run 1: 0/1 seeds passed; failed: [58]\nprev run 2: 0/1 seeds passed; failed: [58]\nprev run 3: 0/1 seeds passed; failed: [58]\n--- after accepting the commit-only state\nnew:        1  crash:ddl-commit-only 1/1 seeds passed \nprev:        1  crash:ddl-commit-only 1/1 seeds passed \n--- 200 crash seeds\n     427  crash:committed\n       1  crash:ddl-commit-only\n       7  crash:index-committed\n       7  crash:index-lost\n     271  crash:lost-uncommitted\n    2378  crash:no-op\n200/200 seeds passed"
+    },
+    {
+      "id": "e28",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "The image rebuilt with the new write path: smoke test, then the write phase inside the container (377.5 ms before, e23).",
+      "command": "docker build -t minivectordb:smoke .; tests/docker_smoke.sh; python3 bench/bench.py --docker minivectordb:smoke --phase write (x2)",
+      "output": "1. statements, rollback, filtered TopK\n2. data survives a restart\n3. acknowledged commit survives SIGKILL of the container\n4. clean exit on quit\nPASS (minivectordb:smoke, 30.1 MB)\n--- write phase in the container, twice\nwrite  T=   169.7 ms  ready= 145.8 ms  M_peak=  7.57 MiB (end: anon 7.03, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.10s (sys 0.03)  io.stat r 0.00 w 5.45\nwrite  T=   170.9 ms  ready= 138.7 ms  M_peak=  7.57 MiB (end: anon 7.02, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.10s (sys 0.02)  io.stat r 0.00 w 5.45"
+    },
+    {
+      "id": "e29",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "First A/B of the exact index where it cannot prune: 50 clusters at sigma 0.5 (first four lines), then uniform data; MVDB_IVF=0 disables the index. Visiting rows list by list was ~1.6x slower. Then the same after the cached rows are relaid out list by list when the index is built. Lines were cut by the command (cut -c1-150, then -c1-110).",
+      "command": "python3 bench/bench.py [--clusters 50 --sigma 0.5] --phase query [--env MVDB_IVF=0] (x2 each), before and after the relayout",
+      "output": "ivf=0 query  T=   282.6 ms  ready=  28.6 ms  M_peak=  6.83 MiB (end: anon 5.99, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.26s (sys 0.01)  peak@ready\nivf   query  T=   469.1 ms  ready=  91.3 ms  M_peak=  6.89 MiB (end: anon 6.19, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.50s (sys 0.01)  peak@ready\nivf=0 query  T=   317.0 ms  ready=  22.8 ms  M_peak=  6.87 MiB (end: anon 6.00, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.29s (sys 0.01)  peak@ready\nivf   query  T=   442.3 ms  ready=  83.0 ms  M_peak=  6.68 MiB (end: anon 6.19, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.48s (sys 0.01)  peak@ready\nuniform ivf=0 query  T=   307.2 ms  ready=  25.5 ms  M_peak=  6.91 MiB (end: anon 5.99, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.29s (sys 0.00)  peak@ready\nuniform ivf   query  T=   519.4 ms  ready=  86.4 ms  M_peak=  6.67 MiB (end: anon 6.19, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.55s (sys 0.02)  peak@ready\nuniform ivf=0 query  T=   283.6 ms  ready=  25.5 ms  M_peak=  6.76 MiB (end: anon 5.99, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.26s (sys 0.01)  peak@ready\nuniform ivf   query  T=   457.9 ms  ready=  87.0 ms  M_peak=  6.67 MiB (end: anon 6.19, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.49s (sys 0.01)  peak@ready\n--- after the relayout\nuniform ivf=0 query  T=   313.7 ms  ready=  27.0 ms  M_peak=  6.59 MiB (end: anon 5.99, file 0.00)  B=   5.06 MiB (r 5.06, w\nuniform ivf   query  T=   309.7 ms  ready=  85.7 ms  M_peak=  6.67 MiB (end: anon 6.27, file 0.00)  B=   5.06 MiB (r 5.06, w\ns0.5 ivf=0    query  T=   284.1 ms  ready=  25.5 ms  M_peak=  6.79 MiB (end: anon 5.99, file 0.00)  B=   5.06 MiB (r 5.06, w\ns0.5 ivf      query  T=   302.1 ms  ready=  86.4 ms  M_peak=  6.69 MiB (end: anon 6.25, file 0.00)  B=   5.06 MiB (r 5.06, w\nuniform ivf=0 query  T=   289.5 ms  ready=  26.9 ms  M_peak=  6.71 MiB (end: anon 6.00, file 0.00)  B=   5.06 MiB (r 5.06, w\nuniform ivf   query  T=   298.2 ms  ready=  84.4 ms  M_peak=  6.63 MiB (end: anon 6.26, file 0.00)  B=   5.06 MiB (r 5.06, w\ns0.5 ivf=0    query  T=   323.7 ms  ready=  24.5 ms  M_peak=  6.67 MiB (end: anon 5.99, file 0.00)  B=   5.06 MiB (r 5.06, w\ns0.5 ivf      query  T=   300.6 ms  ready=  88.2 ms  M_peak=  6.59 MiB (end: anon 6.25, file 0.00)  B=   5.06 MiB (r 5.06, w"
+    },
+    {
+      "id": "e30",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Index off against on, five interleaved rounds per data shape (10,000 x 128, 1,000 queries, half filtered), summarised by a script over the printed lines: medians of T and M_peak, and the set of recall values seen.",
+      "command": "python3 bench/bench.py [--clusters 50 --sigma 0.15|0.3|0.5] --phase query [--env MVDB_IVF=0], 5 rounds; median summary",
+      "output": "uniform  off T median  305.4 ms  M_peak median 6.73 MiB  recall [('1.0000', '1.0000')]\nuniform  on  T median  315.3 ms  M_peak median 6.63 MiB  recall [('1.0000', '1.0000')]\ns0.15    off T median  309.5 ms  M_peak median 6.75 MiB  recall [('1.0000', '1.0000')]\ns0.15    on  T median   49.5 ms  M_peak median 6.68 MiB  recall [('1.0000', '1.0000')]\ns0.3     off T median  288.9 ms  M_peak median 6.81 MiB  recall [('1.0000', '1.0000')]\ns0.3     on  T median   50.6 ms  M_peak median 6.76 MiB  recall [('1.0000', '1.0000')]\ns0.5     off T median  287.4 ms  M_peak median 6.70 MiB  recall [('1.0000', '1.0000')]\ns0.5     on  T median  305.1 ms  M_peak median 6.69 MiB  recall [('1.0000', '1.0000')]"
+    },
+    {
+      "id": "e31",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Do the tests reach the index? A build that prunes at 0.9 x the bound (wrong) run through the differential test with MVDB_IVF_MIN_ROWS=1, which puts the index on every table; then the final build.",
+      "command": "MVDB_IVF_MIN_ROWS=1 python3 tests/difftest.py --bin <mutant> --seeds 0:30; cargo test; difftest --seeds 100:200 (forced, default); --seeds 0:100 --crash (forced)",
+      "output": "--- planted bug (prune at 0.9 x the bound), index forced on, seeds 0:30, first four failures\nseed 2 FAILED: step 320: `SELECT id, cat, L2_DISTANCE(v, '[1.5]') AS distance FROM T2 ORDER BY distance LIMIT 3`\nseed 4 FAILED: step 184: `SELECT id, L2_DISTANCE(v, '[-0.25]') AS distance FROM t0 ORDER BY distance LIMIT 6`\nseed 6 FAILED: step 214: `SELECT id, cat, L2_DISTANCE(v, '[1.5, 0, 1.25, -2]') AS distance FROM T2 ORDER BY distance LIMIT 3 OFFSET 1`\nseed 10 FAILED: step 308: `SELECT id, L2_DISTANCE(v, '[1.75, -0.5, 2]') AS distance FROM T2 ORDER BY L2_DISTANCE(v, '[1.75, -0.5, 2]') LIMIT 1`\n--- final build: unit tests, then seeds 100:200 with the index forced on and with defaults\ntest result: ok. 38 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.15s\nforced: 100/100 seeds passed\ndefault: 100/100 seeds passed\n--- final build, crash seeds 0:100, index forced on\n     256  crash:committed\n       1  crash:ddl-commit-only\n       5  crash:index-committed\n       2  crash:index-lost\n     113  crash:lost-uncommitted\n    1170  crash:no-op\n100/100 seeds passed"
+    },
+    {
+      "id": "e32",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "With the index in the build: the write phase is unchanged (no SELECT, so no index), and the Docker image still passes.",
+      "command": "python3 bench/bench.py --phase write (x3, cut at 120 characters); docker build; tests/docker_smoke.sh",
+      "output": "write  T=   153.7 ms  ready=  12.8 ms  M_peak=  7.38 MiB (end: anon 6.90, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cp\nwrite  T=   153.1 ms  ready=  14.4 ms  M_peak=  7.23 MiB (end: anon 6.90, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cp\nwrite  T=   156.4 ms  ready=  15.4 ms  M_peak=  7.23 MiB (end: anon 6.89, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cp\n--- docker build; tests/docker_smoke.sh\nPASS (minivectordb:smoke, 30.1 MB)"
     }
   ],
   "retrospective": [],
   "limitations": [
+    "Clustered benchmark data (bench.py --clusters) is a synthetic Gaussian mixture chosen by the agent; the task's own data distribution was not published at the time of writing.",
     "The wire format, error codes and ready marker are placeholders; the official test driver was not published at the time of writing.",
     "Benchmarks ran on one desktop machine (i5-9400F, NVMe ext4), mostly outside Docker with I/O from /proc/<pid>/io; inside Docker (e23) io.stat gave the same byte counts.",
     "The Docker base images were fetched by a script through a local proxy (e22) because the Docker daemon on this machine cannot reach Docker Hub; the grading environment pulls them itself.",

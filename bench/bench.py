@@ -52,6 +52,10 @@ def parse_args():
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--categories", type=int, default=10)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--clusters", type=int, default=0,
+                    help="draw rows and queries from this many Gaussian clusters (centers uniform in [-1, 1)) "
+                         "instead of uniformly from [-1, 1)")
+    ap.add_argument("--sigma", type=float, default=0.15, help="per-dimension spread of each cluster")
     ap.add_argument("--style", choices=["multi", "txn"], default="multi",
                     help="multi: one autocommit INSERT of --batch rows; txn: BEGIN, --batch single-row INSERTs, COMMIT")
     ap.add_argument("--phase", choices=["all", "write", "query"], default="all")
@@ -85,6 +89,12 @@ def gen_workload(a):
     def vec():
         return [round(rng.uniform(-1.0, 1.0), 6) for _ in range(a.dim)]
 
+    if a.clusters:
+        centers = [[rng.uniform(-1.0, 1.0) for _ in range(a.dim)] for _ in range(a.clusters)]
+
+        def vec():
+            return [round(c + rng.gauss(0.0, a.sigma), 6) for c in centers[rng.randrange(a.clusters)]]
+
     rows = [(i, rng.choice(cats), vec()) for i in range(1, a.rows + 1)]
     queries = [(rng.choice(cats) if q % 2 else None, vec()) for q in range(a.warmup + a.queries)]
     return rows, queries
@@ -111,10 +121,16 @@ def query_sql(a, cat, v):
     return f"SELECT {cols} FROM items{where} ORDER BY {dist} LIMIT {a.k};"
 
 
+def workload_key(a):
+    params = [a.seed, a.rows, a.dim, a.categories, a.warmup, a.queries, a.k]
+    if a.clusters:
+        params += [a.clusters, a.sigma]
+    return hashlib.sha256(json.dumps(params).encode()).hexdigest()[:16]
+
+
 def ground_truth(a, rows, queries):
     """Exact distances of every query's true top K, cached per workload."""
-    key = hashlib.sha256(json.dumps([a.seed, a.rows, a.dim, a.categories, a.warmup, a.queries, a.k]).encode()).hexdigest()[:16]
-    path = os.path.join(a.workdir, f"truth-{key}.json")
+    path = os.path.join(a.workdir, f"truth-{workload_key(a)}.json")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             return json.load(f)
@@ -362,7 +378,8 @@ def main():
         check_fresh(a.bin)
     os.makedirs(a.workdir, exist_ok=True)
     rows, queries = gen_workload(a)
-    data_dir = os.path.join(a.workdir, "data")
+    # The query phase reopens what the last write phase of the same workload left.
+    data_dir = os.path.join(a.workdir, f"data-{workload_key(a)}" if a.clusters else "data")
     tag = f"mvdb-bench-{os.getpid()}"
     rev = subprocess.run(["git", "-C", ROOT, "describe", "--always", "--dirty"], capture_output=True, text=True).stdout.strip()
     out = []
@@ -375,7 +392,8 @@ def main():
         for r in out:
             show(r)
             f.write(json.dumps({"label": a.label, "rev": rev, "env": a.env, "style": a.style,
-                                "rows": a.rows, "dim": a.dim, "queries": a.queries, **r}) + "\n")
+                                "rows": a.rows, "dim": a.dim, "queries": a.queries,
+                                "clusters": a.clusters, "sigma": a.sigma if a.clusters else None, **r}) + "\n")
 
 
 if __name__ == "__main__":

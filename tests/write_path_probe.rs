@@ -64,7 +64,7 @@ fn fresh_dir(name: &str) -> PathBuf {
 }
 
 fn execute_all(stmts: &[Statement], sync: bool) {
-    let opts = EngineOptions { log: LogOptions { sync, ..LogOptions::default() }, cache_budget: 256 << 20 };
+    let opts = EngineOptions { log: LogOptions { sync, ..LogOptions::default() }, cache_budget: 256 << 20, ivf_min_rows: usize::MAX };
     let mut engine = Engine::open(&fresh_dir("write_path_probe"), opts).unwrap();
     for s in stmts {
         engine.execute(s).unwrap();

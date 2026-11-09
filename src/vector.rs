@@ -124,6 +124,15 @@ impl F32Bound {
         dist * dist * (1.0 + self.rel) + self.abs
     }
 
+    /// Smallest exact squared distance consistent with an `l2_sq_f32`
+    /// result (0 when the result overflowed).
+    pub fn lower(&self, approx: f32) -> f64 {
+        if !approx.is_finite() {
+            return 0.0;
+        }
+        ((approx as f64 - self.abs) / (1.0 + self.rel)).max(0.0)
+    }
+
     /// False only when `approx` proves the row's distance exceeds the one
     /// `cutoff` was computed from.
     #[inline]

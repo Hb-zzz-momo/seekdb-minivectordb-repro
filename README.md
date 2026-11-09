@@ -30,7 +30,8 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Docker image (pinned bases, `tests/docker_smoke.sh`) | builds, smoke-tested, benchmarked |
 | Write path: single-pass vector parsing, no re-lexing | done, unit- and differential-tested, measured |
 | Wire format, error codes, ready marker | waiting for the official test driver |
-| Vector index (ANN), log compaction | next |
+| Exact vector index (k-means lists, triangle-inequality pruning) | done, unit-, differential- and crash-tested, measured |
+| Approximate (ANN) mode, log compaction | next |
 
 ## Testing
 
@@ -39,6 +40,7 @@ cargo test
 cargo build --release
 python3 tests/difftest.py --seeds 0:100 --steps 400            # results vs reference model
 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash    # plus kill -9 and recovery
+MVDB_IVF_MIN_ROWS=1 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash   # vector index on every table
 ```
 
 `tests/difftest.py` generates random sessions (DDL, multi-row INSERT with
@@ -67,6 +69,7 @@ python3 bench/bench.py                               # write phase, then query p
 python3 bench/bench.py --env MVDB_DROP_CACHE=0       # same, without page-cache dropping
 python3 bench/bench.py --docker minivectordb:smoke   # inside the image, with io.stat
 python3 bench/bench.py --phase query --floor         # same queries, scan removed
+python3 bench/bench.py --clusters 50 --sigma 0.15    # Gaussian clusters instead of uniform data
 ```
 
 `bench/bench.py` follows the task's benchmark: 10,000 rows of 128-d vectors
@@ -113,9 +116,38 @@ which any submission measured this way pays too. The same binary also uses
 more CPU per query there (0.35 s instead of 0.29 s), consistent with a native
 probe in which idle gaps between statements raise the cost of each query.
 
+Tables of 4,096 rows or more also get an exact vector index. Rows are
+grouped into about √n lists around k-means centroids, and each list keeps
+an upper bound on its members' distance to the centroid. By the triangle
+inequality no member of a list is closer to the query than
+`|q - c| - radius`, so a TopK visits lists in that order and stops at the
+first one whose bound exceeds the K-th distance found so far; results,
+ties included, are the same as a full scan. The bound uses the float32
+kernel's proven error bound plus a padding far above f64 rounding. When the
+index is built (during recovery, on `CREATE VECTOR INDEX`, or before a TopK
+once the table is big enough or has doubled), the cached rows are moved so
+each list is contiguous, which keeps a scan that has to visit every list as
+fast as the plain one. It is never built during the write phase; building
+it adds about 60 ms to recovery for 10,000 rows.
+
+Query phase, median of five, recall 1.0 in every case, peak memory
+unchanged (6.6-6.8 MiB):
+
+| Data (10,000 x 128) | Without index | With index |
+|---|---|---|
+| uniform in [-1, 1) | 305 ms | 315 ms |
+| 50 clusters, σ = 0.15 | 310 ms | 50 ms |
+| 50 clusters, σ = 0.3 | 289 ms | 51 ms |
+| 50 clusters, σ = 0.5 | 287 ms | 305 ms |
+
+The bounds only prune when clusters are tight relative to the distances
+between them; on uniform data or wide clusters the index visits every row.
+
 Environment variables for experiments only: `MVDB_CACHE_BYTES` (row cache
 budget; default a quarter of the cgroup memory limit) and
-`MVDB_DROP_CACHE=0` (keep log pages in the page cache).
+`MVDB_DROP_CACHE=0` (keep log pages in the page cache), `MVDB_IVF=0` (no
+vector index) and `MVDB_IVF_MIN_ROWS` (table size from which the index is
+used; the differential tests set it to 1).
 
 ## Semantics chosen where the task text is silent
 

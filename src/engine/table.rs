@@ -8,12 +8,15 @@ use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
 use super::expr::{holds, ColPred, PredValue};
+use super::ivf::Ivf;
+use super::topk::TopK;
 use crate::error::DbResult;
 use crate::sql::ast::CmpOp;
 use crate::storage::catalog::TableDef;
 use crate::storage::log::{LogStore, RowLoc};
 use crate::storage::row::decode_row;
 use crate::types::{DataType, Value};
+use crate::bail;
 
 const NO_SLOT: u32 = u32::MAX;
 
@@ -231,6 +234,58 @@ impl RowCache {
         }
     }
 
+    /// Moves every row from slot `order[i]` to slot `i`; `order` is a
+    /// permutation of all slots. Live rows must come first, so the free slots
+    /// end up at the back. Vectors move in place, one cycle at a time, so the
+    /// biggest column is never copied whole.
+    fn permute(&mut self, order: &[u32]) {
+        fn gather<T: Copy>(v: &[T], order: &[u32]) -> Vec<T> {
+            order.iter().map(|&s| v[s as usize]).collect()
+        }
+        self.pks = gather(&self.pks, order);
+        self.live = gather(&self.live, order);
+        let live = self.live.iter().filter(|&&l| l).count();
+        debug_assert!(self.live[..live].iter().all(|&l| l));
+        self.free = (live as u32..order.len() as u32).rev().collect();
+        for c in &mut self.cols {
+            match c {
+                ColData::Pk => {}
+                ColData::Int(v) => *v = gather(v, order),
+                ColData::Str(s) => s.spans = gather(&s.spans, order),
+                ColData::Vector { dim, data } => {
+                    let dim = *dim;
+                    let mut done = vec![false; order.len()];
+                    let mut tmp = vec![0f32; dim];
+                    for start in 0..order.len() {
+                        if done[start] {
+                            continue;
+                        }
+                        tmp.copy_from_slice(&data[start * dim..][..dim]);
+                        let mut j = start;
+                        loop {
+                            done[j] = true;
+                            let k = order[j] as usize;
+                            if k == start {
+                                data[j * dim..][..dim].copy_from_slice(&tmp);
+                                break;
+                            }
+                            data.copy_within(k * dim..(k + 1) * dim, j * dim);
+                            j = k;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dimension and packed floats of a vector column.
+    fn vectors(&self, col: usize) -> Option<(usize, &[f32])> {
+        match self.cols.get(col)? {
+            ColData::Vector { dim, data } => Some((*dim, data)),
+            _ => None,
+        }
+    }
+
     fn view(&self, slot: usize) -> RowView<'_> {
         RowView { pk: self.pks[slot], src: Src::Cache(self, slot) }
     }
@@ -276,12 +331,18 @@ pub struct Table {
     pub rows: BTreeMap<i64, Entry>,
     /// When present, holds every row of `rows`.
     cache: Option<RowCache>,
+    /// The table's vector column, if it has one.
+    vector_col: Option<usize>,
+    /// Index over the cached vector column, built on first need (see
+    /// `prepare_index`) and then kept in step with every committed change.
+    index: Option<Ivf>,
 }
 
 impl Table {
     pub fn new(def: TableDef) -> Table {
         let cache = Some(RowCache::new(&def));
-        Table { def, rows: BTreeMap::new(), cache }
+        let vector_col = def.columns.iter().position(|c| matches!(c.ty, DataType::Vector(_)));
+        Table { def, rows: BTreeMap::new(), cache, vector_col, index: None }
     }
 
     pub fn is_cached(&self) -> bool {
@@ -289,12 +350,13 @@ impl Table {
     }
 
     pub fn cache_bytes(&self) -> usize {
-        self.cache.as_ref().map_or(0, RowCache::bytes)
+        self.cache.as_ref().map_or(0, RowCache::bytes) + self.index.as_ref().map_or(0, Ivf::bytes)
     }
 
     /// Switches the table to reading rows from the log.
     pub fn drop_cache(&mut self) {
         self.cache = None;
+        self.index = None;
         for e in self.rows.values_mut() {
             e.slot = NO_SLOT;
         }
@@ -309,10 +371,20 @@ impl Table {
         let old = self.rows.get(&pk).map_or(NO_SLOT, |e| e.slot);
         let slot = match (&mut self.cache, row) {
             (Some(cache), Some(row)) => {
+                let index = &mut self.index;
                 if old != NO_SLOT {
                     cache.remove(old);
+                    if let Some(ix) = index {
+                        ix.remove(old);
+                    }
                 }
-                cache.insert(pk, row)
+                let slot = cache.insert(pk, row);
+                if let (Some(ix), Some(col)) = (index, self.vector_col) {
+                    if let ValRef::Vector(v) = cache.get(slot as usize, col) {
+                        ix.insert(slot, v);
+                    }
+                }
+                slot
             }
             _ => NO_SLOT,
         };
@@ -323,6 +395,9 @@ impl Table {
         if let Some(e) = self.rows.remove(&pk) {
             if let (Some(cache), true) = (&mut self.cache, e.slot != NO_SLOT) {
                 cache.remove(e.slot);
+                if let Some(ix) = &mut self.index {
+                    ix.remove(e.slot);
+                }
             }
         }
     }
@@ -360,6 +435,77 @@ impl Table {
             };
             if !go {
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds the vector index for `topk_indexed` if the table has none or
+    /// has more than doubled since it was built, as long as the table is
+    /// cached, has a vector column and at least `min_rows` rows. The cached
+    /// rows are then laid out list by list, so a TopK scan through the index
+    /// reads memory in order even when it has to visit every list.
+    pub fn prepare_index(&mut self, min_rows: usize) {
+        let (Some(cache), Some(col)) = (&mut self.cache, self.vector_col) else {
+            return;
+        };
+        let n = self.rows.len();
+        if n == 0 || n < min_rows || self.index.as_ref().is_some_and(|ix| n <= 2 * ix.built_rows) {
+            return;
+        }
+        let Some((dim, data)) = cache.vectors(col) else {
+            return;
+        };
+        let mut ix = Ivf::build(dim, data, &cache.live);
+        let order = ix.slot_order(cache.live.len());
+        cache.permute(&order);
+        let mut new_slot = vec![NO_SLOT; order.len()];
+        for (new, &old) in order.iter().enumerate() {
+            new_slot[old as usize] = new as u32;
+        }
+        for e in self.rows.values_mut() {
+            e.slot = new_slot[e.slot as usize];
+        }
+        ix.remap(&new_slot);
+        self.index = Some(ix);
+    }
+
+    pub fn has_index(&self) -> bool {
+        self.index.is_some()
+    }
+
+    /// Offers to `top` every committed row where the predicates and `rest`
+    /// hold and `skip` does not, through the index made by `prepare_index`.
+    /// Lists are visited by increasing lower bound, and the scan stops at the
+    /// first list that cannot beat the K-th distance so far, so `top` ends up
+    /// as if every row had been offered.
+    pub fn topk_indexed(
+        &self,
+        preds: &[ColPred<'_>],
+        skip: impl Fn(i64) -> bool,
+        rest: impl Fn(&RowView<'_>) -> bool,
+        top: &mut TopK<'_>,
+    ) -> DbResult<()> {
+        let (Some(cache), Some(col), Some(ix)) = (&self.cache, self.vector_col, &self.index) else {
+            bail!(Internal, "vector index used before it was prepared");
+        };
+        let probes: Option<Vec<Probe<'_>>> = preds.iter().map(|p| Probe::new(cache, p)).collect();
+        for (bound, l) in ix.order(top.query()) {
+            if top.kth().is_some_and(|kth| bound > kth) {
+                break;
+            }
+            for &slot in ix.list(l) {
+                let s = slot as usize;
+                let row = cache.view(s);
+                let pass = match &probes {
+                    Some(probes) => probes.iter().all(|p| p.holds(s)),
+                    None => preds.iter().all(|p| p.test(&row)),
+                };
+                if pass && !skip(row.pk) && rest(&row) {
+                    if let ValRef::Vector(v) = cache.get(s, col) {
+                        top.offer(row.pk, v);
+                    }
+                }
             }
         }
         Ok(())
@@ -428,6 +574,92 @@ mod tests {
 
     fn row(pk: i64, s: &str, n: i64) -> Vec<Value> {
         vec![Value::Str(s.into()), Value::Int(pk), Value::Vector(vec![pk as f32, -1.0]), Value::Int(n)]
+    }
+
+    /// The index's TopK equals offering every row, before and after the rows
+    /// are relaid out, through updates and deletes, with and without filters.
+    #[test]
+    fn indexed_topk_matches_full_scan() {
+        let def = TableDef {
+            id: 1,
+            name: "t".into(),
+            columns: vec![
+                Column { name: "id".into(), ty: DataType::BigInt },
+                Column { name: "cat".into(), ty: DataType::Varchar(4) },
+                Column { name: "v".into(), ty: DataType::Vector(8) },
+            ],
+            pk: 0,
+            vector_index: None,
+        };
+        let mut x = 99u64;
+        let mut unit = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        let centers: Vec<Vec<f32>> = (0..12).map(|_| (0..8).map(|_| unit() * 5.0).collect()).collect();
+        let mut point = |c: usize| -> Vec<f32> {
+            // Quarter steps make exact distance ties common.
+            centers[c % 12].iter().map(|v| ((v + unit() * 0.6) * 4.0).round() / 4.0).collect()
+        };
+        let loc = RowLoc { seg: 0, off: 0, len: 0 };
+        let mut table = Table::new(def);
+        let mut model: BTreeMap<i64, Vec<Value>> = BTreeMap::new();
+        let put = |table: &mut Table, model: &mut BTreeMap<i64, Vec<Value>>, pk: i64, v: Vec<f32>| {
+            let row = vec![Value::Int(pk), Value::Str(format!("c{}", pk % 3)), Value::Vector(v)];
+            table.apply_put(pk, loc, Some(row.clone()));
+            model.insert(pk, row);
+        };
+        for pk in 0..3000 {
+            put(&mut table, &mut model, pk, point(pk as usize));
+        }
+        for pk in (0..3000).step_by(5) {
+            table.apply_delete(pk);
+            model.remove(&pk);
+        }
+        table.prepare_index(1);
+        assert!(table.has_index());
+        for pk in (1..3000).step_by(7) {
+            put(&mut table, &mut model, pk, point(pk as usize + 5));
+        }
+        for pk in 3000..3400 {
+            put(&mut table, &mut model, pk, point(pk as usize));
+        }
+        for pk in (2..3400).step_by(11) {
+            table.apply_delete(pk);
+            model.remove(&pk);
+        }
+        for (pk, row) in &model {
+            let e = table.rows[pk];
+            assert_eq!(&table.cache.as_ref().unwrap().view(e.slot as usize).to_values(), row);
+        }
+        let dir = std::env::temp_dir().join(format!("mvdb-ivf-test-{}", std::process::id()));
+        let log = LogStore::open(&dir, Default::default(), |_, _| Ok(())).unwrap();
+        for qi in 0..200 {
+            let q = point(qi);
+            let k = [1, 5, 10, 50][qi % 4];
+            let cat = format!("c{}", qi % 3);
+            let preds: Vec<ColPred<'_>> = if qi % 2 == 1 {
+                vec![ColPred { col: 1, op: CmpOp::Eq, value: PredValue::Str(&cat) }]
+            } else {
+                Vec::new()
+            };
+            let mut full = TopK::new(&q, k);
+            table
+                .scan_unordered(&log, i64::MIN..=i64::MAX, &preds, |row| {
+                    if let ValRef::Vector(v) = row.get(2) {
+                        full.offer(row.pk, v);
+                    }
+                    Ok(true)
+                })
+                .unwrap();
+            let mut indexed = TopK::new(&q, k);
+            table.topk_indexed(&preds, |_| false, |_| true, &mut indexed).unwrap();
+            assert_eq!(indexed.into_sorted(), full.into_sorted(), "query {qi}");
+        }
+        drop(log);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Random puts and deletes against a model map, with string sizes that

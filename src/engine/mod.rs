@@ -7,6 +7,7 @@
 //! in-memory tables. DDL and BEGIN implicitly commit an open transaction.
 
 pub mod expr;
+mod ivf;
 mod query;
 pub mod result;
 mod table;
@@ -31,14 +32,30 @@ pub struct EngineOptions {
     pub log: LogOptions,
     /// Bytes of decoded rows kept in memory across all tables.
     pub cache_budget: usize,
+    /// Tables with at least this many rows get a vector index for TopK.
+    pub ivf_min_rows: usize,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
         // MVDB_DROP_CACHE=0 is for benchmarks only.
         let drop_cache = std::env::var("MVDB_DROP_CACHE").map_or(true, |v| v != "0");
-        EngineOptions { log: LogOptions { drop_cache, ..LogOptions::default() }, cache_budget: default_cache_budget() }
+        EngineOptions {
+            log: LogOptions { drop_cache, ..LogOptions::default() },
+            cache_budget: default_cache_budget(),
+            ivf_min_rows: default_ivf_min_rows(),
+        }
     }
+}
+
+/// `MVDB_IVF=0` disables the vector index (for comparisons);
+/// `MVDB_IVF_MIN_ROWS` changes the table size from which it is used (tests
+/// set it low to exercise the index on small tables).
+pub fn default_ivf_min_rows() -> usize {
+    if std::env::var("MVDB_IVF").is_ok_and(|v| v == "0") {
+        return usize::MAX;
+    }
+    std::env::var("MVDB_IVF_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)
 }
 
 /// `MVDB_CACHE_BYTES`, else a quarter of the cgroup memory limit, else 256 MiB.
@@ -59,6 +76,7 @@ struct Tables {
     by_name: HashMap<String, u32>,
     next_id: u32,
     cache_budget: usize,
+    ivf_min_rows: usize,
 }
 
 impl Tables {
@@ -144,9 +162,20 @@ pub struct Engine {
 impl Engine {
     /// Opens the database in `dir`, recovering committed state from the log.
     pub fn open(dir: &Path, opts: EngineOptions) -> DbResult<Engine> {
-        let mut tables =
-            Tables { by_id: HashMap::new(), by_name: HashMap::new(), next_id: 1, cache_budget: opts.cache_budget };
+        let mut tables = Tables {
+            by_id: HashMap::new(),
+            by_name: HashMap::new(),
+            next_id: 1,
+            cache_budget: opts.cache_budget,
+            ivf_min_rows: opts.ivf_min_rows,
+        };
         let log = LogStore::open(dir, opts.log, |_, ops| tables.replay(ops))?;
+        // Index builds are part of recovery, before the database reports
+        // ready, so the first query does not pay for one.
+        for t in tables.by_id.values_mut() {
+            t.prepare_index(opts.ivf_min_rows);
+        }
+        tables.enforce_budget();
         Ok(Engine { log, tables, txn: Txn::default(), vars: HashMap::new() })
     }
 
@@ -208,7 +237,16 @@ impl Engine {
                     }
                 }
             }
-            Statement::Select(s) => query::select(&self.log, &self.tables, &self.txn, s),
+            Statement::Select(s) => {
+                // A likely TopK: build the vector index first if the table
+                // has outgrown the one it has (a no-op otherwise).
+                if s.order_by.len() == 1 && s.limit.is_some() {
+                    if let Some(t) = self.tables.lookup(&s.table).ok().and_then(|id| self.tables.by_id.get_mut(&id)) {
+                        t.prepare_index(self.tables.ivf_min_rows);
+                    }
+                }
+                query::select(&self.log, &self.tables, &self.txn, s)
+            }
             Statement::Set { name, value } => {
                 use crate::sql::ast::{Expr, Literal};
                 let v = match value {
@@ -297,7 +335,9 @@ impl Engine {
                 self.log.append(&[Op::CreateIndex { table: id, name: ix.name.clone() }])?;
                 if let Some(t) = self.tables.by_id.get_mut(&id) {
                     t.def.vector_index = Some(ix.name.clone());
+                    t.prepare_index(self.tables.ivf_min_rows);
                 }
+                self.tables.enforce_budget();
             }
             _ => bail!(Internal, "not a DDL statement"),
         }

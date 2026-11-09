@@ -71,6 +71,16 @@ impl<'q> TopK<'q> {
         }
     }
 
+    pub fn query(&self) -> &'q [f32] {
+        self.query
+    }
+
+    /// Distance of the K-th row so far, once K rows are held: rows farther
+    /// away can no longer place.
+    pub fn kth(&self) -> Option<f64> {
+        (self.k > 0 && self.heap.len() == self.k).then(|| self.heap.peek().map_or(f64::INFINITY, |top| top.0 .0))
+    }
+
     /// Primary keys, nearest first.
     pub fn into_sorted(self) -> Vec<i64> {
         self.heap.into_sorted_vec().into_iter().map(|(_, pk)| pk).collect()
