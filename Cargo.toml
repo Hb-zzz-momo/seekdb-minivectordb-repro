@@ -1,0 +1,23 @@
+[package]
+name = "minivectordb"
+version = "0.1.0"
+edition = "2021"
+description = "MiniVectorDB: a lightweight single-process vector database with SQL, durable transactions and crash recovery"
+publish = false
+
+[[bin]]
+name = "minivectordb"
+path = "src/main.rs"
+
+# No third-party dependencies: the image builds offline-safe and nothing
+# outside this crate executes storage, SQL or vector search.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# Keep unwinding so a bug in one statement can be caught and reported as an
+# error instead of killing the process.
+panic = "unwind"

@@ -1,0 +1,77 @@
+{
+  "format": "minivectordb-learning-log",
+  "version": 1,
+  "synthetic": false,
+  "material_scope": "Real record of developing MiniVectorDB (OceanBase 2026 tiebreaker) with the Claude Code agent. source=student entries are the student's messages, verbatim. source=agent entries are condensed summaries of the agent's replies, not verbatim. source=tool entries quote actual command output.",
+  "redaction": "No credentials or tokens are included.",
+  "conversations": [
+    {
+      "id": "c1",
+      "date": "2026-11-09",
+      "source": "student",
+      "content": "Task: Competition Tiebreaker Problem Solving\n1. Problem Details:\n\n* Problem Document: https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/vzt7rbh4125g18wx (contains 2 tiebreaker tasks)\n* Baseline Repository: https://github.com/oceanbase/seekdb/tree/2026-competition-round2\n\n2. Objective:\n\n* Solve both tasks aiming for a 100% full score.\n* Implement optimized, robust, and competition-ready solutions as quickly as possible.\n\n3. Questions & Workflow:\n\n* How should we set up the environment and collaborate? Should I clone the repo locally and share the relevant files/diffs, or how do you suggest we proceed?\n* Can you access the problem link directly? (If not, let me know and I will paste the problem specifications here).\n\nPlease outline the step-by-step execution plan first."
+    },
+    {
+      "id": "c2",
+      "date": "2026-11-09",
+      "source": "agent",
+      "kind": "summary",
+      "content": "Read the Yuque pages with a browser (plain fetch only returned the title). The tiebreaker section holds one problem (MiniVectorDB, built from scratch) plus the scoring rules; the two 40-point items are a performance ranking and an Agent-prompt ranking, both gated on passing every hidden MySQL case. Points come from rank, so a fixed 100% is not something any team can guarantee. The round-2 branch has the seekdb engine deleted and empty Dockerfile/conversation.json placeholders; the official test driver and problem package were not published yet. Proposed phases: setup, correct engine, own differential/crash test harness, adapt to the driver, performance, submission."
+    },
+    {
+      "id": "c3",
+      "date": "2026-11-09",
+      "source": "student",
+      "content": "Rust\n\n1. Urgency & Competitive Strategy:\n   * Speed is everything. In this tiebreaker, ranking is determined by whoever achieves a full score first. We are competing in real-time against other teams using Agents. We are NOT waiting for the deadline; we need to achieve 100% full score as fast as humanly possible.\n2. Language Choice:\n   * Let's use Rust. A single crash gives an immediate 0 score, so Rust's memory safety gives us the highest reliability while maintaining raw C-level performance and SIMD capabilities.\n3. Repo & System Permissions:\n   * Authorized: Go ahead and push upstream's 2026-competition-round2 branch to zhangxh0526/seekdb and clone it directly into /home/legend/project/oceanbase.\n   * I have installed Docker / am ready to execute any setup commands.\n4. Execution Protocol:\n   * Skip unnecessary pleasantries. Immediately start Phase 0 (Setup) and Phase 1 (Core Engine & Storage) right now.\n   * Keep the architecture modular and stdin/stdout protocol layer lightweight so we can instantly wire it to the official test driver the minute it drops.\n   * For agent/conversation.json, pause briefly only at critical architectural forks with clear A/B choices or tricky edge-case validations so I can steer and record the required evidence without blocking your coding speed.\n\nLet's begin right now: push the branch, set up the repo skeleton, and write the minimal SQL parser & page storage."
+    },
+    {
+      "id": "c4",
+      "date": "2026-11-09",
+      "source": "agent",
+      "kind": "summary",
+      "content": "Asked an A/B question on storage. A: append-only log that is also the table store, one checksummed frame per commit plus fdatasync, in-RAM primary-key index, recovery truncates the torn tail. B: page-based B+tree with buffer pool, redo WAL and checkpoints. Agent recommended A."
+    },
+    {
+      "id": "c5",
+      "date": "2026-11-09",
+      "source": "student",
+      "content": "I choose Option A: Log-structured.\nHere is my architectural rationale and key constraints we must adhere to:\n\n1. Zero-Crash Guarantee: B+Tree with ARIES recovery is prone to corruption and segfaults during edge-case splits or buffer eviction. With the competition rule stating \"a single crash gives an immediate 0 score\", Log-structured is vastly superior because recovery is trivially idempotent (just scan records and truncate torn tail).\n2. Optimal I/O Score: In Option A, data is written exactly once (WAL IS the data log), whereas B+Tree writes twice (WAL + Page flushing). This gives us a major competitive edge in the 20% disk I/O scoring weight.\n3. Critical Trap to Prevent (Hidden Test OOM):\n   * You noted that hidden tests will exceed container RAM. Therefore, we CANNOT keep all raw vectors permanently cached in RAM.\n   * Keep the PK index in RAM (PK -> file offset is very compact, ~16 bytes/row).\n   * For TopK vector scans: implement a streaming reader (read in chunks of e.g. 64KB/128KB with SIMD distance calculation) instead of loading the whole dataset into RAM.\n   * Remember: Peak container memory includes OS PageCache. After flushing or large sequential scans, advise the OS via posix_fadvise(POSIX_FADV_DONTNEED) so the kernel file cache doesn't inflate our memory footprint.\n\nProceed with Option A immediately. Start with scaffolding the crate, the lexer, and the append-only log engine!"
+    },
+    {
+      "id": "c6",
+      "date": "2026-11-09",
+      "source": "agent",
+      "kind": "summary",
+      "content": "Agreed with A and raised one problem with the scan plan: in the benchmark the whole vector set is about 10,000 x 128 x 4 B = 5 MB; if every one of the 1,000 queries streams it from disk after DONTNEED dropped the cache, that is about 5 GB of physical reads, which the I/O metric counts. Proposed instead: keep a compact in-memory copy while a table fits a memory budget, stream with DONTNEED only above it; on the write path drop pages after fdatasync except the partial last page, which the next append would otherwise read back. Also noted that the rules rank the final version at the deadline by the performance metric and do not break ties by submission time."
+    }
+  ],
+  "decisions": [
+    {
+      "id": "d1",
+      "topic": "storage architecture",
+      "options": [
+        "A: log-structured, log is the data",
+        "B: page B+tree + WAL + buffer pool"
+      ],
+      "chosen": "A",
+      "chosen_by": "student",
+      "rationale_ref": "/conversations/4/content",
+      "status": "planned; not yet measured"
+    }
+  ],
+  "experiments": [
+    {
+      "id": "e1",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Unit tests for lexer, parser, vector literal validation, row codec and commit log, including recovery after cutting the log at every byte offset inside the last frame.",
+      "command": "cargo test",
+      "output": "test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s"
+    }
+  ],
+  "retrospective": [],
+  "limitations": [
+    "Executor, transactions and the wire format are not implemented yet; the official test driver was not published at the time of writing.",
+    "No performance measurement has been taken yet; the I/O and memory reasoning in c6 is a prediction."
+  ]
+}
