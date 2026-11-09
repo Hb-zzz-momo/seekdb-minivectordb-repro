@@ -30,6 +30,7 @@ import json
 import math
 import os
 import random
+import shlex
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,12 @@ def parse_args():
     ap.add_argument("--with-distance", action="store_true", help="also select the distance and check it")
     ap.add_argument("--drop-between-queries", action="store_true",
                     help="drop the data files from the page cache after every query (emulates a streaming scan that discards what it read)")
+    ap.add_argument("--floor", action="store_true",
+                    help="same query text, but on an empty key range (id = 0): times parsing, round trips and "
+                         "output without any scan, i.e. what an infinitely fast index would leave; results unchecked")
+    ap.add_argument("--docker", metavar="IMAGE",
+                    help="run the database in this image instead (as the current user, data directory bind-mounted "
+                         "at /data); also reports the container cgroup's io.stat")
     ap.add_argument("--workdir", default=os.path.join(ROOT, "target/bench"))
     ap.add_argument("--label", default="")
     return ap.parse_args()
@@ -99,7 +106,8 @@ def insert_sql(a, batch):
 def query_sql(a, cat, v):
     dist = f"L2_DISTANCE(embedding, {vec_sql(v)})"
     cols = f"id, {dist} AS d" if a.with_distance else "id"
-    where = f" WHERE category = '{cat}'" if cat is not None else ""
+    conds = (["id = 0"] if a.floor else []) + ([f"category = '{cat}'"] if cat is not None else [])
+    where = " WHERE " + " AND ".join(conds) if conds else ""
     return f"SELECT {cols} FROM items{where} ORDER BY {dist} LIMIT {a.k};"
 
 
@@ -127,14 +135,30 @@ def ground_truth(a, rows, queries):
 
 # ---------------------------------------------------------------- database
 
+def docker_cmd(args):
+    """Argument list for the docker CLI, through `sg docker` when this shell
+    lacks the docker group."""
+    if os.access("/var/run/docker.sock", os.W_OK):
+        return ["docker"] + args
+    return ["sg", "docker", "-c", shlex.join(["docker"] + args)]
+
+
 class Db:
     def __init__(self, a, data_dir, unit, log_path):
-        env = ["-E", "MVDB_FORMAT=jsonl"]
-        for kv in a.env:
-            env += ["-E", kv]
-        cmd = (["systemd-run", "--user", "--pipe", "--quiet", "--collect", f"--unit={unit}",
-                "-p", "MemoryAccounting=yes", "-p", f"MemoryMax={a.mem_max}", "-p", "MemorySwapMax=0"]
-               + env + ["--", a.bin, "--data-dir", data_dir])
+        if a.docker:
+            env = ["-e", "MVDB_FORMAT=jsonl"]
+            for kv in a.env:
+                env += ["-e", kv]
+            cmd = docker_cmd(["run", "-i", "--rm", "--name", unit, "--user", f"{os.getuid()}:{os.getgid()}",
+                              "-m", a.mem_max, "--memory-swap", a.mem_max] + env
+                             + ["-v", f"{os.path.abspath(data_dir)}:/data", a.docker])
+        else:
+            env = ["-E", "MVDB_FORMAT=jsonl"]
+            for kv in a.env:
+                env += ["-E", kv]
+            cmd = (["systemd-run", "--user", "--pipe", "--quiet", "--collect", f"--unit={unit}",
+                    "-p", "MemoryAccounting=yes", "-p", f"MemoryMax={a.mem_max}", "-p", "MemorySwapMax=0"]
+                   + env + ["--", a.bin, "--data-dir", data_dir])
         self.unit = unit
         self.log = open(log_path, "w", encoding="utf-8")
         self.t_spawn = time.perf_counter()
@@ -144,6 +168,12 @@ class Db:
         self.t_ready = time.perf_counter()
         if json.loads(ready or "{}").get("ready") is not True:
             self.fail(f"no ready line, got {ready!r}")
+        if a.docker:
+            out = subprocess.run(docker_cmd(["inspect", "-f", "{{.Id}} {{.State.Pid}}", unit]),
+                                 capture_output=True, text=True, check=True).stdout.split()
+            self.cgroup = f"{CGROUP_ROOT}/system.slice/docker-{out[0]}.scope"
+            self.pid = int(out[1])
+            return
         show = subprocess.run(["systemctl", "--user", "show", "-P", "ControlGroup", "-P", "MainPID", f"{unit}.service"],
                               capture_output=True, text=True, check=True).stdout.split()
         self.pid = int(show[0]) if show[0].isdigit() else int(show[1])
@@ -184,7 +214,17 @@ class Db:
         cpu = kv(os.path.join(self.cgroup, "cpu.stat"))
         with open(f"/proc/{self.pid}/io", encoding="utf-8") as f:
             io = {k.strip(): int(v) for k, v in (l.split(":") for l in f)}
-        return {
+        extra = {}
+        io_stat = os.path.join(self.cgroup, "io.stat")
+        if os.path.exists(io_stat):
+            rb = wb = 0
+            with open(io_stat, encoding="utf-8") as f:
+                for line in f:
+                    fields = dict(x.split("=") for x in line.split()[1:])
+                    rb += int(fields.get("rbytes", 0))
+                    wb += int(fields.get("wbytes", 0))
+            extra = {"io_stat_rbytes": rb, "io_stat_wbytes": wb}
+        return {**extra,
             "mem_peak": peak, "mem_anon": mem.get("anon", 0), "mem_file": mem.get("file", 0),
             "read_bytes": io["read_bytes"], "write_bytes": io["write_bytes"],
             "cpu_user_s": cpu.get("user_usec", 0) / 1e6, "cpu_sys_s": cpu.get("system_usec", 0) / 1e6,
@@ -258,6 +298,9 @@ def phase_query(a, rows, queries, truth, data_dir, unit):
     st = db.stats()
     db.close()
 
+    if a.floor:
+        return {"phase": "query-floor", "time_s": t, "ready_s": ready_s, **st,
+                "mem_peak_at_ready": peak_ready, "mem_peak_after_warmup": peak_warm}
     cat_of = {i: c for i, c, _ in rows}
     recall = {"filtered": [], "unfiltered": []}
     max_rel_err = 0.0
@@ -293,9 +336,12 @@ def show(r):
             f"M_peak={r['mem_peak'] / MIB:6.2f} MiB (end: anon {r['mem_anon'] / MIB:.2f}, file {r['mem_file'] / MIB:.2f})  "
             f"B={(r['read_bytes'] + r['write_bytes']) / MIB:7.2f} MiB (r {r['read_bytes'] / MIB:.2f}, w {r['write_bytes'] / MIB:.2f})  "
             f"cpu={r['cpu_user_s'] + r['cpu_sys_s']:.2f}s (sys {r['cpu_sys_s']:.2f})")
-    if r["phase"] == "query":
+    if "io_stat_rbytes" in r:
+        line += f"  io.stat r {r['io_stat_rbytes'] / MIB:.2f} w {r['io_stat_wbytes'] / MIB:.2f}"
+    if r["phase"].startswith("query"):
         line += f"  peak@ready={r['mem_peak_at_ready'] / MIB:.2f} peak@warm={r['mem_peak_after_warmup'] / MIB:.2f}"
-        line += f"  recall f={r['recall_filtered']:.4f} u={r['recall_unfiltered']:.4f}"
+        if "recall_filtered" in r:
+            line += f"  recall f={r['recall_filtered']:.4f} u={r['recall_unfiltered']:.4f}"
         if "dist_max_rel_err" in r:
             line += f" dist_err={r['dist_max_rel_err']:.1e}"
     print(line)
