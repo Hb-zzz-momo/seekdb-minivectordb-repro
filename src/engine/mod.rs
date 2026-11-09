@@ -217,6 +217,11 @@ impl Engine {
                 self.ddl(stmt)
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                match stmt {
+                    Statement::Update(s) => self.prepare_read(&s.table)?,
+                    Statement::Delete(s) => self.prepare_read(&s.table)?,
+                    _ => {}
+                }
                 self.txn.begin_statement();
                 let r = match stmt {
                     Statement::Insert(s) => query::insert(&self.tables, &mut self.txn, s),
@@ -238,6 +243,7 @@ impl Engine {
                 }
             }
             Statement::Select(s) => {
+                self.prepare_read(&s.table)?;
                 // A likely TopK: build the vector index first if the table
                 // has outgrown the one it has (a no-op otherwise).
                 if s.order_by.len() == 1 && s.limit.is_some() {
@@ -259,6 +265,21 @@ impl Engine {
                 Ok(ExecResult::ok(0))
             }
         }
+    }
+
+    /// Before a statement reads table `name`: brings back its row cache if
+    /// writes set it aside. An unknown name is left for the statement to
+    /// report.
+    fn prepare_read(&mut self, name: &str) -> DbResult<()> {
+        let Ok(id) = self.tables.lookup(name) else {
+            return Ok(());
+        };
+        let others: usize = self.tables.by_id.iter().filter(|(&i, _)| i != id).map(|(_, t)| t.cache_bytes()).sum();
+        let budget = self.tables.cache_budget.saturating_sub(others);
+        if let Some(t) = self.tables.by_id.get_mut(&id) {
+            t.load_cache(&self.log, budget)?;
+        }
+        Ok(())
     }
 
     /// Makes the transaction's changes durable as one log frame, then applies
@@ -286,6 +307,9 @@ impl Engine {
         let mut locs = self.log.append(&ops)?.into_iter();
         for (id, rows) in changes {
             let Some(table) = self.tables.by_id.get_mut(&id) else { continue };
+            if !table.read {
+                table.defer_cache();
+            }
             for (pk, row) in rows {
                 match row {
                     Some(values) => match locs.next() {

@@ -192,6 +192,33 @@ impl RowCache {
         RowCache { pks: Vec::new(), live: Vec::new(), cols, free: Vec::new() }
     }
 
+    /// Bytes `n` rows take, not counting string contents.
+    fn estimate(def: &TableDef, n: usize) -> usize {
+        let per_row: usize = def
+            .columns
+            .iter()
+            .map(|c| match c.ty {
+                DataType::BigInt => 8,
+                DataType::Varchar(_) => size_of::<(usize, usize)>(),
+                DataType::Vector(dim) => dim as usize * 4,
+            })
+            .sum();
+        n.saturating_mul(per_row + 9)
+    }
+
+    fn reserve(&mut self, n: usize) {
+        self.pks.reserve_exact(n);
+        self.live.reserve_exact(n);
+        for c in &mut self.cols {
+            match c {
+                ColData::Pk => {}
+                ColData::Int(v) => v.reserve_exact(n),
+                ColData::Str(s) => s.spans.reserve_exact(n),
+                ColData::Vector { dim, data } => data.reserve_exact(n * *dim),
+            }
+        }
+    }
+
     fn insert(&mut self, pk: i64, row: Vec<Value>) -> u32 {
         let slot = match self.free.pop() {
             Some(s) => s as usize,
@@ -331,6 +358,10 @@ pub struct Table {
     pub rows: BTreeMap<i64, Entry>,
     /// When present, holds every row of `rows`.
     cache: Option<RowCache>,
+    /// The cache was set aside by `defer_cache`; `load_cache` rebuilds it.
+    deferred: bool,
+    /// A statement has read the table since the database was opened.
+    pub read: bool,
     /// The table's vector column, if it has one.
     vector_col: Option<usize>,
     /// Index over the cached vector column, built on first need (see
@@ -342,7 +373,7 @@ impl Table {
     pub fn new(def: TableDef) -> Table {
         let cache = Some(RowCache::new(&def));
         let vector_col = def.columns.iter().position(|c| matches!(c.ty, DataType::Vector(_)));
-        Table { def, rows: BTreeMap::new(), cache, vector_col, index: None }
+        Table { def, rows: BTreeMap::new(), cache, deferred: false, read: false, vector_col, index: None }
     }
 
     pub fn is_cached(&self) -> bool {
@@ -360,6 +391,48 @@ impl Table {
         for e in self.rows.values_mut() {
             e.slot = NO_SLOT;
         }
+    }
+
+    /// Sets the cache aside until a statement reads the table, so a table
+    /// that is only written to (a bulk load) keeps no decoded rows in memory.
+    pub fn defer_cache(&mut self) {
+        if self.cache.is_some() {
+            self.drop_cache();
+            self.deferred = true;
+        }
+    }
+
+    /// Marks the table as read and rebuilds a deferred cache from the log.
+    /// A table that would take more than `budget` bytes stays read from the
+    /// log, as if its cache had been dropped for size.
+    pub fn load_cache(&mut self, log: &LogStore, budget: usize) -> DbResult<()> {
+        self.read = true;
+        if !std::mem::take(&mut self.deferred) {
+            return Ok(());
+        }
+        let too_big = || {
+            eprintln!("engine: table {} does not fit the {} byte row cache; reading it from disk", self.def.name, budget);
+            Ok(())
+        };
+        if RowCache::estimate(&self.def, self.rows.len()) > budget {
+            return too_big();
+        }
+        let mut cache = RowCache::new(&self.def);
+        cache.reserve(self.rows.len());
+        let mut slots = Vec::with_capacity(self.rows.len());
+        let mut buf = Vec::new();
+        for (&pk, e) in &self.rows {
+            log.read(e.loc, &mut buf)?;
+            slots.push(cache.insert(pk, decode_row(&self.def, pk, &buf)?));
+            if cache.bytes() > budget {
+                return too_big();
+            }
+        }
+        for (e, slot) in self.rows.values_mut().zip(slots) {
+            e.slot = slot;
+        }
+        self.cache = Some(cache);
+        Ok(())
     }
 
     /// Records a committed insert or update. `row` is required while the

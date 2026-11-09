@@ -29,6 +29,7 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Columnar row cache with filter pushdown | done, differential-tested, measured |
 | Docker image (pinned bases, `tests/docker_smoke.sh`) | builds, smoke-tested, benchmarked |
 | Write path: single-pass vector parsing, no re-lexing | done, unit- and differential-tested, measured |
+| Row cache built on first read | done, differential- and crash-tested, measured |
 | Wire format, error codes, ready marker | waiting for the official test driver |
 | Exact vector index (k-means lists, triangle-inequality pruning) | done, unit-, differential- and crash-tested, measured |
 | Organizers' public sample cases (`mysqltest/`) | 5/5 pass (`tests/public_cases.py`) |
@@ -108,11 +109,17 @@ multiply or divide, bit-identical to `str::parse::<f32>`; anything else goes
 through the general parser. What remains of the write phase is mostly the
 100 `fdatasync` calls (about 0.8 ms each here).
 
+A table that is written to before anything reads it (a bulk load) keeps no
+decoded rows in memory: its row cache is set aside at the first commit and
+rebuilt from the log by the first statement that reads the table. Recovery
+still decodes rows while it replays the log, since it reads them anyway, so
+a database reopened for queries starts with its cache ready.
+
 Median of five runs on an i5-9400F, NVMe ext4:
 
 | Phase | T | Peak memory | Disk I/O |
 |---|---|---|---|
-| write (100 commits) | 151 ms | 7.3 MiB | 5.45 MiB written |
+| write (100 commits) | 149 ms | 2.1 MiB | 5.45 MiB written |
 | query (1,000 TopK) | 311 ms | 6.8 MiB | 5.06 MiB read |
 
 Inside the container (`--docker`) `io.stat` reports the same bytes as
