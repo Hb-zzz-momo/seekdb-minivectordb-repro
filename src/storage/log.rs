@@ -178,7 +178,11 @@ impl LogStore {
             self.dropped_upto = keep_from;
         }
         if seg.len >= self.opts.segment_bytes {
-            self.new_segment(seg_id + 1)?;
+            // The frame is durable, so the commit has happened even if the
+            // next segment cannot be started; the next append tries again.
+            if let Err(e) = self.new_segment(seg_id + 1) {
+                eprintln!("log: cannot start segment {}: {e}; segment {seg_id} stays active", seg_id + 1);
+            }
         }
         Ok(locs)
     }
@@ -221,7 +225,12 @@ impl LogStore {
     }
 
     fn new_segment(&mut self, id: u32) -> DbResult<()> {
-        let file = OpenOptions::new().read(true).write(true).create_new(true).open(segment_path(&self.dir, id))?;
+        // An attempt that failed after creating the file leaves it empty.
+        let path = segment_path(&self.dir, id);
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        if file.metadata()?.len() != 0 {
+            bail!(Corrupt, "new segment {} already holds data", id);
+        }
         if self.opts.sync {
             File::open(&self.dir)?.sync_all()?;
         }
@@ -585,6 +594,38 @@ mod tests {
         })
         .unwrap();
         assert_eq!(scanned, 20);
+    }
+
+    /// A commit whose frame is written stands even when the rollover after
+    /// it fails (here: the directory is read-only); the rollover happens on
+    /// a later append.
+    #[test]
+    fn failed_rollover_keeps_the_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let o = LogOptions { segment_bytes: 100, sync: true, drop_cache: true };
+        let (mut log, _) = replay(&dir.0, o.clone());
+        let mode = |m: u32| fs::set_permissions(&dir.0, fs::Permissions::from_mode(m)).unwrap();
+        mode(0o555);
+        if File::create(dir.0.join("probe")).is_ok() {
+            mode(0o755);
+            eprintln!("skipped: running with permission to write a read-only directory");
+            return;
+        }
+        let a = log.append(&[put(1, 1, 150)]).unwrap();
+        let b = log.append(&[put(2, 2, 150)]).unwrap();
+        assert_eq!(log.active_id(), 1);
+        mode(0o755);
+        let c = log.append(&[put(3, 3, 150)]).unwrap();
+        assert_eq!(log.active_id(), 2);
+        drop(log);
+        let (log, seen) = replay(&dir.0, o);
+        assert_eq!(seen.len(), 3);
+        let mut buf = Vec::new();
+        for (loc, fill) in [(a[0], 1), (b[0], 2), (c[0], 3)] {
+            log.read(loc, &mut buf).unwrap();
+            assert_eq!(buf, vec![fill; 150]);
+        }
     }
 
     #[test]
