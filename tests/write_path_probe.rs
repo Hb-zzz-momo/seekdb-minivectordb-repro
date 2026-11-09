@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use minivectordb::engine::{Engine, EngineOptions, IndexOptions};
-use minivectordb::protocol::Splitter;
+use minivectordb::protocol;
 use minivectordb::sql::ast::{Expr, Literal, Statement};
 use minivectordb::sql::{self, parser::is_blank};
 use minivectordb::storage::log::LogOptions;
@@ -47,13 +47,9 @@ fn best_ms(mut f: impl FnMut()) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-fn split(lines: &[String]) -> Vec<String> {
-    let mut sp = Splitter::default();
-    let mut out = Vec::new();
-    for l in lines {
-        sp.push(l, &mut out);
-    }
-    out
+/// Statements as the main loop frames them: one per non-empty line.
+fn split(lines: &[String]) -> Vec<&str> {
+    lines.iter().filter_map(|l| protocol::statement(l)).collect()
 }
 
 fn fresh_dir(name: &str) -> PathBuf {
@@ -94,7 +90,7 @@ fn write_path_stages() {
 
     println!("{} statements, {:.1} MB of SQL", stmts.len(), bytes as f64 / 1e6);
     let stages: [(&str, f64); 6] = [
-        ("split into statements", best_ms(|| drop(split(&lines)))),
+        ("frame statements (one per line)", best_ms(|| drop(split(&lines)))),
         ("is_blank check", best_ms(|| assert!(!stmts.iter().any(|s| is_blank(s))))),
         ("parse (tokenize + AST)", best_ms(|| drop(stmts.iter().map(|s| sql::parse(s).unwrap()).collect::<Vec<_>>()))),
         ("parse_vector on all literals", best_ms(|| drop(vectors.iter().map(|v| parse_vector(v).unwrap()).collect::<Vec<_>>()))),

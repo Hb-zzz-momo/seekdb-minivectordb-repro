@@ -6,7 +6,7 @@ use minivectordb::db_err;
 use minivectordb::engine::result::ExecResult;
 use minivectordb::engine::{Engine, EngineOptions};
 use minivectordb::error::DbResult;
-use minivectordb::protocol::{self, Format, Splitter};
+use minivectordb::protocol::{self, Format};
 use minivectordb::sql;
 
 fn main() {
@@ -35,10 +35,8 @@ fn main() {
 
     let stdin = io::stdin();
     let mut input = stdin.lock();
-    let mut splitter = Splitter::default();
-    let mut stmts = Vec::new();
     let mut raw = Vec::new();
-    'session: loop {
+    loop {
         raw.clear();
         match input.read_until(b'\n', &mut raw) {
             Ok(0) => break,
@@ -48,24 +46,14 @@ fn main() {
                 break;
             }
         }
-        splitter.push(&String::from_utf8_lossy(&raw), &mut stmts);
-        for text in stmts.drain(..) {
-            if protocol::is_exit(&text) {
-                break 'session;
-            }
-            if sql::parser::is_blank(&text) {
-                continue;
-            }
-            let res = run(&mut engine, &text);
-            let _ = protocol::write_result(&mut out, fmt, &res);
-            let _ = out.flush();
+        let line = String::from_utf8_lossy(&raw);
+        let Some(text) = protocol::statement(&line) else { continue };
+        if protocol::is_exit(text) {
+            break;
         }
-    }
-    if let Some(text) = splitter.finish() {
-        if !protocol::is_exit(&text) && !sql::parser::is_blank(&text) {
-            let res = run(&mut engine, &text);
-            let _ = protocol::write_result(&mut out, fmt, &res);
-        }
+        let res = run(&mut engine, text);
+        let _ = protocol::write_result(&mut out, fmt, &res);
+        let _ = out.flush();
     }
     let _ = out.flush();
     // Dropping the engine discards any open transaction; every committed one
