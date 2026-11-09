@@ -69,6 +69,19 @@
       "source": "agent",
       "kind": "summary",
       "content": "Built bench/bench.py after the spec's section 3.3 (write phase from an empty table, 100 rows per commit; cold restart, warmup, 1,000 TopK queries, half filtered). Each phase runs in its own systemd user unit to read memory.peak from a real cgroup; this machine's user manager has no io controller, so I/O comes from /proc/<pid>/io, not io.stat. Added an AVX2/FMA float32 kernel used only as a prefilter: a row gets its exact f64 distance only if a proven error bound says it could still enter the TopK, so results stay identical to an exact scan. The fadvise prediction held for the write phase but not for the query phase, where peak memory is reached during recovery, before the old end-of-replay drop; recovery now drops pages as it reads. One mistake on the way: the first re-measurement ran a stale release binary (cargo test does not rebuild it) and showed no change; the harness now refuses a binary older than the sources."
+    },
+    {
+      "id": "c11",
+      "date": "2026-11-09",
+      "source": "student",
+      "content": "I choose Option A: Columnar in-memory cache.\nHere is the architectural reasoning for conversation.json:\n\n1. Zero-Crash Rule vs. SIGBUS Hazard: Option B (mmap) introduces severe SIGBUS crash hazards if files are truncated, rotated, or recovered under unexpected signals. Given the competition's strict rule that a single crash zeroes the score, we cannot afford any unsafe mmap failure modes. Safe, managed Rust data structures are strictly required.\n2. Eliminating the 23 ns Scan Overhead: The profiler identified ~23 ns/row of non-arithmetic overhead (pointer indirection, heap headers, B-tree traversal). A columnar layout (Structure of Arrays) packs vector floats into contiguous, aligned memory chunks, giving optimal L1/L2 prefetching and eliminating per-row pointer chasing.\n3. Filter Pushdown Advantage: Since 50% of benchmark queries have equality filters, the columnar layout allows us to scan the compact filter column first. Filter-rejected rows completely avoid reading the 512-byte vector into cache lines, minimizing memory bus bandwidth.\n4. README Clarification: Yes, recording my approval covering the README's second item (strict validation regardless of matching rows) is correct.\n\nPlease commit the current AVX2 and benchmark work first, and then proceed with implementing Option A (Columnar Cache). Let's see the new query benchmark numbers!"
+    },
+    {
+      "id": "c12",
+      "date": "2026-11-09",
+      "source": "agent",
+      "kind": "summary",
+      "content": "Corrected two points of c11 before building: no profiler was used (perf was unavailable; the ~23 ns/row came from timing unfiltered queries against the kernel benchmark), and filter-rejected rows already skipped the vector before this change. Built the columnar cache (pk and int arrays, one string buffer with spans, packed vectors, slot reuse) and slot-order scans for TopK and ORDER BY. First A/B: memory as estimated (-1.3 MiB) but query time only -10% instead of the estimated ~2.6x; timing by query type showed the B-tree walk and per-row pointers had been cheap (rows allocated in order) and the generic filter evaluation was the real cost. Then added filter pushdown: simple column-constant conditions run as loops over the column arrays and produce a slot list. A crash test failure (seed 825) turned out to be a harness bug present before this change: an index changes no rows, so the crash check could not tell whether a CREATE VECTOR INDEX survived; it now probes by repeating the statement."
     }
   ],
   "decisions": [
@@ -96,7 +109,19 @@
       "chosen": "all four as implemented",
       "chosen_by": "student",
       "rationale_ref": "/conversations/8/content",
-      "status": "approved; to re-check against the official package"
+      "status": "approved, including item 2 as confirmed in c11; to re-check against the official package"
+    },
+    {
+      "id": "d3",
+      "topic": "in-memory row layout",
+      "options": [
+        "A: columnar in-RAM cache",
+        "B: mmap the log and scan it in place"
+      ],
+      "chosen": "A",
+      "chosen_by": "student",
+      "rationale_ref": "/conversations/10/content",
+      "status": "implemented; measured in e13, e18"
     }
   ],
   "experiments": [
@@ -195,12 +220,61 @@
       "purpose": "Crash and differential tests on the rebuilt binary after the recovery change.",
       "command": "python3 tests/difftest.py --seeds 500:540 --steps 400 --crash --stats; python3 tests/difftest.py --seeds 0:30 --steps 400",
       "output": "      84  crash:committed\n      70  crash:lost-uncommitted\n     513  crash:no-op\n40/40 seeds passed\n30/30 seeds passed"
+    },
+    {
+      "id": "e13",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Columnar cache without filter pushdown against the previous commit, five interleaved rounds. Medians: query T 458.2 -> 409.9 ms, query M_peak 8.01 -> 6.75 MiB, write M_peak 8.79 -> 7.59 MiB. Output: round 1.",
+      "command": "python3 bench/bench.py --bin <build of 9110349>; python3 bench/bench.py (alternating, 5 rounds)",
+      "output": "prev     query  T=   496.6 ms  ready=  25.8 ms  M_peak=  8.01 MiB (end: anon 7.32, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.47s (sys 0.01)  peak@ready=8.01 peak@warm=8.01  recall f=1.0000 u=1.0000\ncolumnar write  T=   285.5 ms  ready=  11.9 ms  M_peak=  7.59 MiB (end: anon 7.29, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.21s (sys 0.02)\ncolumnar query  T=   409.9 ms  ready=  23.7 ms  M_peak=  6.66 MiB (end: anon 5.99, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.39s (sys 0.01)  peak@ready=6.66 peak@warm=6.66  recall f=1.0000 u=1.0000"
+    },
+    {
+      "id": "e14",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Why e13 gained so little: engine alone, 500 queries per file (unfiltered TopK, filtered TopK, filter-only scan without ORDER BY), best of three, previous build then columnar (headers shorten the binary paths).",
+      "command": "/usr/bin/time minivectordb < q_unf.sql | q_f.sql | q_filteronly.sql",
+      "output": "== prev\nq_unf: 0.2 s (best of 3)\nq_f: 0.19 s (best of 3)\nq_filteronly: 0.12 s (best of 3)\n== columnar\nq_unf: 0.16 s (best of 3)\nq_f: 0.18 s (best of 3)\nq_filteronly: 0.14 s (best of 3)"
+    },
+    {
+      "id": "e15",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Can the differential test see a bug in the new unordered scan? Mutant: committed rows that the open transaction changed are not hidden.",
+      "command": "python3 tests/difftest.py --bin <mutant> --seeds 0:20 --steps 400",
+      "output": "seed 0 FAILED: step 15: `SELECT id AS x_id, num, cat FROM t1 WHERE id < 6 ORDER BY x_id LIMIT 5`\n  expected: {\"columns\": [\"x_id\", \"num\", \"cat\"], \"rows\": []}\n  got:      {\"columns\": [\"x_id\", \"num\", \"cat\"], \"rows\": [[-3, 4, \"a\"]]}\nseed 1 FAILED: step 252: `SELECT id, L2_DISTANCE(v, '[-0.5,1,0.5]') AS distance FROM t1 ORDER BY distance LIMIT 6`"
+    },
+    {
+      "id": "e16",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Exercise the switch from cache to log reads: a first try with a 20 KB budget never dropped a cache (difftest tables are tiny), so budgets were lowered until drops were logged.",
+      "command": "MVDB_CACHE_BYTES=0|600|2000 python3 tests/difftest.py --seeds 0:30 --steps 400 --keep; MVDB_CACHE_BYTES=600 ... --crash",
+      "output": "cache=0: 30/30 seeds passed\n  cache drops logged: 752\ncache=600: 30/30 seeds passed\n  cache drops logged: 535\ncache=2000: 30/30 seeds passed\n  cache drops logged: 153\ncrash, cache=600: 20/20 seeds passed"
+    },
+    {
+      "id": "e17",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "One crash seed failed; the previous commit's binary failed it the same way. The database was killed during CREATE VECTOR INDEX ix2 and recovered without the index, which is allowed, but the crash check compares only rows and assumed the index existed. After making the check repeat the statement to observe the index, 100 crash seeds were run.",
+      "command": "python3 tests/difftest.py --seeds 800:840 --crash; after the fix --seeds 800:900 --crash --stats",
+      "output": "crash: 39/40 seeds passed; failed: [825]\nseed 825 FAILED: step 62: `CREATE VECTOR INDEX ix2 ON t1(v)`\n  expected: {\"error\": \"Schema\"}\n  got:      {\"ok\": true, \"affected\": 0}\n--- after the fix\n     216  crash:committed\n       3  crash:index-committed\n       1  crash:index-lost\n     174  crash:lost-uncommitted\n    1193  crash:no-op\n100/100 seeds passed"
+    },
+    {
+      "id": "e18",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Columnar cache with filter pushdown against the previous commit, five interleaved rounds. Medians: query T 473.5 -> 310.7 ms, query M_peak 8.05 -> 6.77 MiB, write T 287.7 -> 291.7 ms (no change), write M_peak 8.79 -> 7.59 MiB. Then engine alone per query type as in e14. Output: round 1, then the per-type times (headers shorten the binary paths).",
+      "command": "python3 bench/bench.py (alternating with the 9110349 build, 5 rounds); /usr/bin/time per query type",
+      "output": "prev     query  T=   473.5 ms  ready=  25.2 ms  M_peak=  8.08 MiB (end: anon 7.31, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.45s (sys 0.01)  peak@ready=8.08 peak@warm=8.08  recall f=1.0000 u=1.0000\ncolumnar query  T=   315.1 ms  ready=  24.4 ms  M_peak=  6.71 MiB (end: anon 6.01, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.29s (sys 0.01)  peak@ready=6.71 peak@warm=6.71  recall f=1.0000 u=1.0000\n== prev\nq_unf: 0.21 s (best of 3)\nq_f: 0.19 s (best of 3)\nq_filteronly: 0.12 s (best of 3)\n== columnar + pushdown\nq_unf: 0.18 s (best of 3)\nq_f: 0.08 s (best of 3)\nq_filteronly: 0.13 s (best of 3)"
     }
   ],
   "retrospective": [],
   "limitations": [
     "The wire format, error codes and ready marker are placeholders; the official test driver was not published at the time of writing.",
     "Benchmarks ran on one desktop machine (i5-9400F, NVMe ext4), outside Docker. I/O is from /proc/<pid>/io, not the platform's io.stat, and excludes filesystem journal writes.",
-    "The reference model was written from the same reading of the task as the engine, so it finds implementation bugs but cannot catch a shared misreading of the rules."
+    "The reference model was written from the same reading of the task as the engine, so it finds implementation bugs but cannot catch a shared misreading of the rules.",
+    "Filter pushdown and the benchmark cover one filter shape (string equality over 10 categories); other conditions take the generic per-row path, and SELECT without ORDER BY still walks the primary-key index."
   ]
 }

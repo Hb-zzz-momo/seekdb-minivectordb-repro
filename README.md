@@ -26,8 +26,9 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Append-only commit log with torn-tail recovery | done, crash-tested |
 | Executor: catalog, PK index, row cache, exact TopK, transactions | done, differential-tested |
 | AVX2/FMA distance prefilter (exact results), benchmark harness | done, measured |
+| Columnar row cache with filter pushdown | done, differential-tested, measured |
 | Wire format, error codes, ready marker | waiting for the official test driver |
-| Vector index (ANN), compact in-memory layout, compaction | next |
+| Vector index (ANN), log compaction | next |
 
 ## Testing
 
@@ -64,17 +65,22 @@ io controller, so disk I/O comes from `/proc/<pid>/io` instead of
 Recall@10 against distances computed independently in Python. Every run
 appends to `target/bench/results.jsonl`.
 
-TopK first measures each row with a float32 AVX2/FMA kernel (picked at run
-time, scalar fallback otherwise) and computes the exact f64 distance only
-when a proven error bound says the row could still place, so results and
+While a table fits the memory budget its rows are cached column by column:
+one array per column (strings back to back in one buffer, vectors packed),
+indexed by slot. TopK and ORDER BY queries walk the slots directly instead
+of the primary-key index, and `column <op> constant` conditions run as
+loops over their column arrays first, so only matching rows are looked at.
+Each surviving row is measured with a float32 AVX2/FMA kernel (picked at run
+time, scalar fallback otherwise), and its exact f64 distance is computed
+only when a proven error bound says it could still place, so results and
 distances are the same as a full exact scan.
 
-Median of three runs on an i5-9400F, NVMe ext4:
+Median of five runs on an i5-9400F, NVMe ext4:
 
 | Phase | T | Peak memory | Disk I/O |
 |---|---|---|---|
-| write (100 commits) | 302 ms | 8.8 MiB | 5.45 MiB written |
-| query (1,000 TopK) | 532 ms | 8.0 MiB | 5.06 MiB read |
+| write (100 commits) | 292 ms | 7.6 MiB | 5.45 MiB written |
+| query (1,000 TopK) | 311 ms | 6.8 MiB | 5.06 MiB read |
 
 Environment variables for experiments only: `MVDB_CACHE_BYTES` (row cache
 budget; default a quarter of the cgroup memory limit) and

@@ -805,6 +805,10 @@ def model_snapshot(db, names):
     return {n: ([list(t.rows[pk]) for pk in sorted(t.rows)] if (t := db.get(n)) else None) for n in names}
 
 
+def index_state(model):
+    return {n: t.index for n, t in model.db.items()}
+
+
 def same_snapshot(a, b):
     return all(
         (a[n] is None) == (b[n] is None)
@@ -866,11 +870,32 @@ def run_seed(args, seed):
                 db = Db(args.bin, data, log_path, args.timeout)
                 got = snapshot(db, names)
                 changes = before != after
-                if same_snapshot(got, after):
+                # A vector index changes no rows, so the snapshot cannot tell
+                # whether a CREATE VECTOR INDEX survived the crash.
+                hidden = st.kind == "index" and index_state(model) != index_state(after_model)
+                if same_snapshot(got, after) and not hidden:
                     model = after_model
                     STATS[f"crash:{'committed' if changes else 'no-op'}"] += 1
-                elif same_snapshot(got, before):
+                elif same_snapshot(got, before) and not hidden:
                     STATS["crash:lost-uncommitted"] += 1
+                elif hidden and (same_snapshot(got, after) or same_snapshot(got, before)):
+                    # Repeating the statement fails only if the index exists;
+                    # the model then runs the same probe to stay in step. An
+                    # open transaction is committed in its own log frame
+                    # before the DDL, so its rows can survive without the index.
+                    probe = db.query(sql)
+                    survived = probe.get("error") == "Schema"
+                    if same_snapshot(got, after):
+                        model = after_model
+                        if not survived:
+                            model.table(model.db, st.table).index = None
+                    STATS[f"crash:index-{'committed' if survived else 'lost'}"] += 1
+                    model.restart()
+                    want = model.execute(st)
+                    history.append(f"{sql};  -- probe: did the index survive the crash?")
+                    if not same_result(probe, want):
+                        return fail(f"step {step}: index probe after crash during `{sql}`\n"
+                                    f"  expected: {fmt(want)}\n  got:      {fmt(probe)}")
                 else:
                     return fail(f"step {step}: state after crash during `{sql}` matches neither side\n"
                                 f"  got:    {fmt(got)}\n  before: {fmt(before)}\n  after:  {fmt(after)}")

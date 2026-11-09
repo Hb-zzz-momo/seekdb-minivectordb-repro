@@ -302,7 +302,7 @@ def show(r):
 
 
 def check_fresh(binary):
-    """Refuses a binary older than the sources it is built from."""
+    """Refuses this repository's binary when it is older than its sources."""
     newest = max(os.path.getmtime(os.path.join(d, f))
                  for d, _, fs in os.walk(os.path.join(ROOT, "src")) for f in fs)
     newest = max([newest] + [os.path.getmtime(os.path.join(ROOT, f)) for f in ("Cargo.toml", "Cargo.lock")])
@@ -312,7 +312,8 @@ def check_fresh(binary):
 
 def main():
     a = parse_args()
-    check_fresh(a.bin)
+    if os.path.abspath(a.bin) == os.path.join(ROOT, "target/release/minivectordb"):
+        check_fresh(a.bin)
     os.makedirs(a.workdir, exist_ok=True)
     rows, queries = gen_workload(a)
     data_dir = os.path.join(a.workdir, "data")

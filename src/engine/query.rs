@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 use std::ops::RangeInclusive;
 
-use super::expr::{compile, compile_filter, literal_value, pk_range, CExpr, Kind, Scope};
+use super::expr::{compile, compile_filter, literal_value, pk_range, split_filter, CExpr, ColPred, Kind, Scope};
 use super::result::{cmp_cells, Cell, ExecResult};
 use super::table::{RowView, Table, ValRef};
 use super::topk::TopK;
@@ -28,7 +28,6 @@ fn scan_visible(
     let Some(changes) = changes else {
         return table.scan(log, range, f);
     };
-    let vec_col = table.def.vector_column();
     let mut pending = changes.range(range.clone()).peekable();
     let mut stopped = false;
     table.scan(log, range, |row| {
@@ -39,7 +38,7 @@ fn scan_visible(
             }
             pending.next();
             if let Some(values) = change {
-                if !f(RowView::new(pk, values, vec_col))? {
+                if !f(RowView::new(pk, values))? {
                     stopped = true;
                     return Ok(false);
                 }
@@ -55,7 +54,43 @@ fn scan_visible(
     if !stopped {
         for (&pk, change) in pending {
             if let Some(values) = change {
-                if !f(RowView::new(pk, values, vec_col))? {
+                if !f(RowView::new(pk, values))? {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Like `scan_visible` restricted to rows where every predicate holds, in no
+/// particular order, which lets a cached table be walked slot by slot. For
+/// queries whose output order does not depend on the visiting order.
+fn scan_visible_unordered(
+    table: &Table,
+    log: &LogStore,
+    changes: Option<&Changes>,
+    range: RangeInclusive<i64>,
+    preds: &[ColPred<'_>],
+    mut f: impl FnMut(RowView<'_>) -> DbResult<bool>,
+) -> DbResult<()> {
+    let Some(changes) = changes else {
+        return table.scan_unordered(log, range, preds, f);
+    };
+    let mut stopped = false;
+    table.scan_unordered(log, range.clone(), preds, |row| {
+        if changes.contains_key(&row.pk) {
+            return Ok(true);
+        }
+        let go = f(row)?;
+        stopped = !go;
+        Ok(go)
+    })?;
+    if !stopped {
+        for (&pk, change) in changes.range(range) {
+            if let Some(values) = change {
+                let row = RowView::new(pk, values);
+                if preds.iter().all(|p| p.test(&row)) && !f(row)? {
                     break;
                 }
             }
@@ -255,40 +290,47 @@ pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select) -
         return Ok(ExecResult::Rows { columns, rows: Vec::new() });
     }
     let passes = |row: &RowView<'_>| filter.as_ref().is_none_or(|f| f.test(row));
+    // For unordered scans: column predicates go to the scan, the rest is
+    // tested per row.
+    let (preds, rest) = split_filter(filter.as_ref());
+    let passes_rest = |row: &RowView<'_>| rest.iter().all(|e| e.test(row));
 
     // TopK: ORDER BY L2_DISTANCE(...) ASC LIMIT k; ties go to the smaller pk.
     if let ([(CExpr::Dist { col, query }, false)], Some(limit)) = (order.as_slice(), limit) {
         let mut top = TopK::new(query, offset.saturating_add(limit));
-        scan_visible(table, log, changes, range, &mut |row| {
-            if passes(&row) {
+        scan_visible_unordered(table, log, changes, range, &preds, |row| {
+            if passes_rest(&row) {
                 if let ValRef::Vector(v) = row.get(*col) {
                     top.offer(row.pk, v);
                 }
             }
             Ok(true)
         })?;
-        let vec_col = def.vector_column();
         let mut rows = Vec::new();
         for pk in top.into_sorted().into_iter().skip(offset) {
             let values = get_visible(table, log, changes, pk)?
                 .ok_or_else(|| db_err!(Internal, "row {} vanished during a query", pk))?;
-            let view = RowView::new(pk, &values, vec_col);
+            let view = RowView::new(pk, &values);
             rows.push(outputs.iter().map(|e| e.cell(&view)).collect());
         }
         return Ok(ExecResult::Rows { columns, rows });
     }
 
-    // General path: rows come in pk order; without ORDER BY we can stop as
-    // soon as LIMIT is satisfied.
+    // General path. Without ORDER BY rows come in pk order and we can stop
+    // as soon as LIMIT is satisfied; with it, the sort (pk breaks ties)
+    // fixes the order, so the scan may visit rows in any order.
     let stop_after = if order.is_empty() { limit.map(|l| offset.saturating_add(l)) } else { None };
     let mut found: Vec<(Vec<Cell>, i64, Vec<Cell>)> = Vec::new();
-    scan_visible(table, log, changes, range, &mut |row| {
-        if passes(&row) {
-            let keys = order.iter().map(|(e, _)| e.cell(&row)).collect();
-            found.push((keys, row.pk, outputs.iter().map(|e| e.cell(&row)).collect()));
-        }
+    let mut keep = |row: RowView<'_>| {
+        let keys = order.iter().map(|(e, _)| e.cell(&row)).collect();
+        found.push((keys, row.pk, outputs.iter().map(|e| e.cell(&row)).collect()));
         Ok(stop_after.is_none_or(|n| found.len() < n))
-    })?;
+    };
+    if order.is_empty() {
+        scan_visible(table, log, changes, range, &mut |row| if passes(&row) { keep(row) } else { Ok(true) })?;
+    } else {
+        scan_visible_unordered(table, log, changes, range, &preds, |row| if passes_rest(&row) { keep(row) } else { Ok(true) })?;
+    }
     if !order.is_empty() {
         found.sort_by(|a, b| {
             for (i, (_, desc)) in order.iter().enumerate() {

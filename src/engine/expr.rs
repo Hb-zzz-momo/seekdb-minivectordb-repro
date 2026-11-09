@@ -183,17 +183,7 @@ impl CExpr {
     /// Evaluates a condition.
     pub fn test(&self, row: &RowView<'_>) -> bool {
         match self {
-            CExpr::Cmp(op, l, r) => {
-                let ord = compare(&l.scalar(row), &r.scalar(row));
-                match op {
-                    CmpOp::Eq => ord == Ordering::Equal,
-                    CmpOp::Ne => ord != Ordering::Equal,
-                    CmpOp::Lt => ord == Ordering::Less,
-                    CmpOp::Le => ord != Ordering::Greater,
-                    CmpOp::Gt => ord == Ordering::Greater,
-                    CmpOp::Ge => ord != Ordering::Less,
-                }
-            }
+            CExpr::Cmp(op, l, r) => holds(*op, compare(&l.scalar(row), &r.scalar(row))),
             CExpr::And(a, b) => a.test(row) && b.test(row),
             _ => false,
         }
@@ -214,6 +204,76 @@ impl CExpr {
             Scalar::Str(s) => Cell::Str(s.to_string()),
         }
     }
+}
+
+/// Whether `a op b` holds, given how `a` compares to `b`.
+#[inline]
+pub fn holds(op: CmpOp, ord: Ordering) -> bool {
+    match op {
+        CmpOp::Eq => ord == Ordering::Equal,
+        CmpOp::Ne => ord != Ordering::Equal,
+        CmpOp::Lt => ord == Ordering::Less,
+        CmpOp::Le => ord != Ordering::Greater,
+        CmpOp::Gt => ord == Ordering::Greater,
+        CmpOp::Ge => ord != Ordering::Less,
+    }
+}
+
+/// `column <op> constant` where both sides have the same type, so a cached
+/// table can evaluate it directly on its column arrays.
+pub struct ColPred<'a> {
+    pub col: usize,
+    pub op: CmpOp,
+    pub value: PredValue<'a>,
+}
+
+pub enum PredValue<'a> {
+    Int(i64),
+    Str(&'a str),
+}
+
+impl ColPred<'_> {
+    /// Same result as the `CExpr` it came from.
+    pub fn test(&self, row: &RowView<'_>) -> bool {
+        match (row.get(self.col), &self.value) {
+            (ValRef::Int(x), PredValue::Int(v)) => holds(self.op, x.cmp(v)),
+            (ValRef::Str(x), PredValue::Str(v)) => holds(self.op, x.as_bytes().cmp(v.as_bytes())),
+            _ => false,
+        }
+    }
+}
+
+/// Splits a filter's AND-ed conditions into column predicates and the rest.
+/// The filter holds exactly when every predicate and every rest condition
+/// holds.
+pub fn split_filter(filter: Option<&CExpr>) -> (Vec<ColPred<'_>>, Vec<&CExpr>) {
+    fn walk<'a>(e: &'a CExpr, preds: &mut Vec<ColPred<'a>>, rest: &mut Vec<&'a CExpr>) {
+        match e {
+            CExpr::And(a, b) => {
+                walk(a, preds, rest);
+                walk(b, preds, rest);
+            }
+            CExpr::Cmp(op, l, r) => {
+                let (col, op, lit) = match (&**l, &**r) {
+                    (CExpr::Col(c), lit) => (*c, *op, lit),
+                    (lit, CExpr::Col(c)) => (*c, flip(*op), lit),
+                    _ => return rest.push(e),
+                };
+                let value = match lit {
+                    CExpr::Int(v) => PredValue::Int(*v),
+                    CExpr::Str(s) => PredValue::Str(s),
+                    _ => return rest.push(e),
+                };
+                preds.push(ColPred { col, op, value });
+            }
+            _ => rest.push(e),
+        }
+    }
+    let (mut preds, mut rest) = (Vec::new(), Vec::new());
+    if let Some(f) = filter {
+        walk(f, &mut preds, &mut rest);
+    }
+    (preds, rest)
 }
 
 fn compare(a: &Scalar<'_>, b: &Scalar<'_>) -> Ordering {
