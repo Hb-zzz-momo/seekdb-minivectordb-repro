@@ -647,8 +647,11 @@ impl Table {
     /// Builds the vector index for `topk` if the table has none or has more
     /// than doubled since it was built, as long as the table is cached, has a
     /// vector column and at least `opts.min_rows` rows. With k-means lists
-    /// the cached rows are then laid out list by list, so a TopK scan through
-    /// the lists reads memory in order even when it has to visit every list.
+    /// (tables of at most `opts.max_list_rows` rows) the cached rows are then
+    /// laid out list by list, so a TopK scan through the lists reads memory
+    /// in order even when it has to visit every list. Lists built while the
+    /// table was smaller are kept up to date until the next rebuild, which
+    /// drops them once the table is past the cap.
     pub fn prepare_index(&mut self, opts: IndexOptions) {
         let (Some(cache), Some(col)) = (&mut self.cache, self.vector_col) else {
             return;
@@ -658,7 +661,8 @@ impl Table {
             return;
         }
         self.indexed_rows = n;
-        if opts.lists {
+        self.index = None;
+        if opts.lists && n <= opts.max_list_rows {
             let Some((dim, data)) = cache.vectors(col) else {
                 return;
             };
@@ -858,14 +862,39 @@ mod tests {
     }
 
     /// The cached TopK equals offering every row of a model, with every
-    /// combination of lists and codes, before and after the rows are relaid
-    /// out, through updates and deletes, with and without filters (`=`,
-    /// `<>`, a value no row has, two predicates).
+    /// combination of lists and codes (and lists left out above the row
+    /// cap), before and after the rows are relaid out, through updates and
+    /// deletes, with and without filters (`=`, `<>`, a value no row has, two
+    /// predicates).
     #[test]
     fn cached_topk_matches_model() {
         for (lists, codes) in [(true, true), (true, false), (false, true), (false, false)] {
-            check_cached_topk(IndexOptions { min_rows: 1, lists, codes });
+            check_cached_topk(IndexOptions { min_rows: 1, max_list_rows: usize::MAX, lists, codes });
         }
+        check_cached_topk(IndexOptions { min_rows: 1, max_list_rows: 2000, lists: true, codes: true });
+    }
+
+    /// Lists built below the row cap are dropped by the first rebuild above
+    /// it; the codes stay.
+    #[test]
+    fn lists_are_capped() {
+        let opts = IndexOptions { min_rows: 1, max_list_rows: 100, lists: true, codes: true };
+        let mut table = Table::new(def());
+        let loc = RowLoc { seg: 0, off: 0, len: 0 };
+        for pk in 0..80 {
+            table.apply_put(pk, loc, Some(row(pk, "a", pk)));
+        }
+        table.prepare_index(opts);
+        assert!(table.index.is_some() && table.codes.is_some());
+        for pk in 80..200 {
+            table.apply_put(pk, loc, Some(row(pk, "a", pk)));
+        }
+        table.prepare_index(opts);
+        assert!(table.index.is_none() && table.codes.is_some());
+        let q = [150.2, -1.0];
+        let mut got = TopK::new(&q, 3);
+        table.topk(&[], |_| false, |_| true, &mut got).unwrap();
+        assert_eq!(got.into_sorted(), vec![150, 151, 149]);
     }
 
     fn check_cached_topk(opts: IndexOptions) {
@@ -908,7 +937,7 @@ mod tests {
             model.remove(&pk);
         }
         table.prepare_index(opts);
-        assert_eq!(table.index.is_some(), opts.lists);
+        assert_eq!(table.index.is_some(), opts.lists && table.rows.len() <= opts.max_list_rows);
         assert_eq!(table.codes.is_some(), opts.codes);
         for pk in (1..3000).step_by(7) {
             // Some far outside the range the codes were fitted to.

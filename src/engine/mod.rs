@@ -39,10 +39,13 @@ pub struct EngineOptions {
 
 /// The exact vector index of a cached table: k-means lists (`lists`) and
 /// 8-bit codes of every vector (`codes`), built once the table has
-/// `min_rows` rows.
+/// `min_rows` rows. Lists are built only for tables of at most
+/// `max_list_rows` rows, since k-means grows faster than linearly; larger
+/// tables get the codes alone.
 #[derive(Debug, Clone, Copy)]
 pub struct IndexOptions {
     pub min_rows: usize,
+    pub max_list_rows: usize,
     pub lists: bool,
     pub codes: bool,
 }
@@ -61,11 +64,14 @@ impl Default for EngineOptions {
 
 /// `MVDB_IVF=0` and `MVDB_SQ8=0` leave out the lists or the codes (for
 /// comparisons); `MVDB_IVF_MIN_ROWS` changes the table size from which the
-/// index is used (tests set it low to exercise it on small tables).
+/// index is used (tests set it low to exercise it on small tables), and
+/// `MVDB_IVF_MAX_ROWS` the largest table that gets lists.
 pub fn default_index_options() -> IndexOptions {
     let on = |name: &str| std::env::var(name).map_or(true, |v| v != "0");
+    let num = |name: &str, default| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
     IndexOptions {
-        min_rows: std::env::var("MVDB_IVF_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
+        min_rows: num("MVDB_IVF_MIN_ROWS", 4096),
+        max_list_rows: num("MVDB_IVF_MAX_ROWS", 50_000),
         lists: on("MVDB_IVF"),
         codes: on("MVDB_SQ8"),
     }
