@@ -4,7 +4,7 @@
 //! slot, so a scan walks memory in order and a filter reads only its own
 //! column.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeInclusive;
 
 use super::expr::{holds, ColPred, PredValue};
@@ -95,26 +95,71 @@ enum ColData {
 }
 
 /// Strings of one column, back to back in one buffer.
-#[derive(Default)]
 struct StrCol {
     /// (offset, length) of each slot's string in `arena`.
     spans: Vec<(usize, usize)>,
     arena: String,
     /// Bytes of `arena` that no slot refers to any more.
     garbage: usize,
+    /// While the column has few distinct values: a code per slot, so `=` and
+    /// `<>` against a constant compare integers instead of strings.
+    dict: Option<Dict>,
+}
+
+/// Distinct values a column may have and keep its dictionary.
+const DICT_MAX: usize = 1024;
+/// Code of a free slot.
+const NO_CODE: u32 = u32::MAX;
+/// Code that no slot has: a constant missing from the dictionary.
+const ABSENT: u32 = u32::MAX - 1;
+
+#[derive(Default)]
+struct Dict {
+    codes: Vec<u32>,
+    ids: HashMap<Box<str>, u32>,
+    /// Bytes of the strings in `ids`.
+    text: usize,
 }
 
 impl StrCol {
+    fn new() -> StrCol {
+        StrCol { spans: Vec::new(), arena: String::new(), garbage: 0, dict: Some(Dict::default()) }
+    }
+
     #[inline]
     fn get(&self, slot: usize) -> &str {
         let (off, len) = self.spans[slot];
         &self.arena[off..off + len]
     }
 
+    fn grow(&mut self) {
+        self.spans.push((0, 0));
+        if let Some(d) = &mut self.dict {
+            d.codes.push(NO_CODE);
+        }
+    }
+
     fn set(&mut self, slot: usize, s: &str) {
         self.clear(slot);
         self.spans[slot] = (self.arena.len(), s.len());
         self.arena.push_str(s);
+        if let Some(d) = &mut self.dict {
+            let code = match d.ids.get(s) {
+                Some(&c) => c,
+                None if d.ids.len() < DICT_MAX => {
+                    let c = d.ids.len() as u32;
+                    d.ids.insert(s.into(), c);
+                    d.text += s.len();
+                    c
+                }
+                // Too many distinct values: strings are compared from now on.
+                None => {
+                    self.dict = None;
+                    return;
+                }
+            };
+            d.codes[slot] = code;
+        }
     }
 
     /// Forgets the slot's string. Garbage is kept below half the arena (or
@@ -122,9 +167,18 @@ impl StrCol {
     fn clear(&mut self, slot: usize) {
         self.garbage += self.spans[slot].1;
         self.spans[slot] = (0, 0);
+        if let Some(d) = &mut self.dict {
+            d.codes[slot] = NO_CODE;
+        }
         if self.garbage > 4096 && self.garbage * 2 > self.arena.len() {
             self.compact();
         }
+    }
+
+    /// The code `=` compares with for value `v`, if the column has a
+    /// dictionary.
+    fn code(&self, v: &str) -> Option<u32> {
+        self.dict.as_ref().map(|d| d.ids.get(v).copied().unwrap_or(ABSENT))
     }
 
     /// Rewrites the arena with only the strings still referenced.
@@ -140,7 +194,10 @@ impl StrCol {
     }
 
     fn bytes(&self) -> usize {
-        self.spans.capacity() * size_of::<(usize, usize)>() + self.arena.capacity()
+        let dict = self.dict.as_ref().map_or(0, |d| {
+            d.codes.capacity() * 4 + d.ids.capacity() * (size_of::<(Box<str>, u32)>() + 1) + d.text
+        });
+        self.spans.capacity() * size_of::<(usize, usize)>() + self.arena.capacity() + dict
     }
 }
 
@@ -149,7 +206,7 @@ impl ColData {
         match self {
             ColData::Pk => {}
             ColData::Int(v) => v.push(0),
-            ColData::Str(s) => s.spans.push((0, 0)),
+            ColData::Str(s) => s.grow(),
             ColData::Vector { dim, data } => data.resize(data.len() + *dim, 0.0),
         }
     }
@@ -185,7 +242,7 @@ impl RowCache {
             .map(|(i, c)| match c.ty {
                 _ if i == def.pk => ColData::Pk,
                 DataType::BigInt => ColData::Int(Vec::new()),
-                DataType::Varchar(_) => ColData::Str(StrCol::default()),
+                DataType::Varchar(_) => ColData::Str(StrCol::new()),
                 DataType::Vector(dim) => ColData::Vector { dim: dim as usize, data: Vec::new() },
             })
             .collect();
@@ -199,7 +256,7 @@ impl RowCache {
             .iter()
             .map(|c| match c.ty {
                 DataType::BigInt => 8,
-                DataType::Varchar(_) => size_of::<(usize, usize)>(),
+                DataType::Varchar(_) => size_of::<(usize, usize)>() + 4,
                 DataType::Vector(dim) => dim as usize * 4,
             })
             .sum();
@@ -213,7 +270,12 @@ impl RowCache {
             match c {
                 ColData::Pk => {}
                 ColData::Int(v) => v.reserve_exact(n),
-                ColData::Str(s) => s.spans.reserve_exact(n),
+                ColData::Str(s) => {
+                    s.spans.reserve_exact(n);
+                    if let Some(d) = &mut s.dict {
+                        d.codes.reserve_exact(n);
+                    }
+                }
                 ColData::Vector { dim, data } => data.reserve_exact(n * *dim),
             }
         }
@@ -278,7 +340,12 @@ impl RowCache {
             match c {
                 ColData::Pk => {}
                 ColData::Int(v) => *v = gather(v, order),
-                ColData::Str(s) => s.spans = gather(&s.spans, order),
+                ColData::Str(s) => {
+                    s.spans = gather(&s.spans, order);
+                    if let Some(d) = &mut s.dict {
+                        d.codes = gather(&d.codes, order);
+                    }
+                }
                 ColData::Vector { dim, data } => {
                     let dim = *dim;
                     let mut done = vec![false; order.len()];
@@ -329,6 +396,8 @@ impl RowCache {
 enum Probe<'a> {
     Int(&'a [i64], CmpOp, i64),
     Str(&'a StrCol, CmpOp, &'a [u8]),
+    /// `=` (true) or `<>` (false) on a dictionary-coded string column.
+    Code(&'a [u32], bool, u32),
 }
 
 impl<'a> Probe<'a> {
@@ -336,21 +405,43 @@ impl<'a> Probe<'a> {
         Some(match (cache.cols.get(p.col)?, &p.value) {
             (ColData::Pk, PredValue::Int(v)) => Probe::Int(&cache.pks, p.op, *v),
             (ColData::Int(c), PredValue::Int(v)) => Probe::Int(c, p.op, *v),
-            (ColData::Str(c), PredValue::Str(v)) => Probe::Str(c, p.op, v.as_bytes()),
+            (ColData::Str(c), PredValue::Str(v)) => match (p.op, c.code(v), &c.dict) {
+                (CmpOp::Eq | CmpOp::Ne, Some(code), Some(d)) => Probe::Code(&d.codes, p.op == CmpOp::Eq, code),
+                _ => Probe::Str(c, p.op, v.as_bytes()),
+            },
             _ => return None,
         })
+    }
+
+    /// Live slots where the predicate holds, in slot order.
+    fn select(&self, live: &[bool]) -> Vec<u32> {
+        match self {
+            // Free slots have NO_CODE, which equals no constant's code.
+            Probe::Code(c, true, v) => (0..c.len()).filter(|&s| c[s] == *v).map(|s| s as u32).collect(),
+            _ => (0..live.len()).filter(|&s| live[s] && self.holds(s)).map(|s| s as u32).collect(),
+        }
     }
 
     #[inline]
     fn holds(&self, slot: usize) -> bool {
         match self {
             Probe::Int(c, op, v) => holds(*op, c[slot].cmp(v)),
+            Probe::Code(c, eq, v) => (c[slot] == *v) == *eq,
             Probe::Str(c, op, v) => {
                 let (off, len) = c.spans[slot];
                 holds(*op, c.arena.as_bytes()[off..off + len].cmp(v))
             }
         }
     }
+}
+
+/// Live slots where every probe holds (at least one probe).
+fn select(cache: &RowCache, probes: &[Probe<'_>]) -> Vec<u32> {
+    let mut sel = probes[0].select(&cache.live);
+    for p in &probes[1..] {
+        sel.retain(|&s| p.holds(s as usize));
+    }
+    sel
 }
 
 pub struct Table {
@@ -603,20 +694,15 @@ impl Table {
         let (Some(cache), Some(probes)) = (&self.cache, probes) else {
             return self.scan(log, range, |row| if preds.iter().all(|p| p.test(&row)) { f(row) } else { Ok(true) });
         };
-        let Some((first, others)) = probes.split_first() else {
+        if probes.is_empty() {
             for (slot, &live) in cache.live.iter().enumerate() {
                 if live && !f(cache.view(slot))? {
                     break;
                 }
             }
             return Ok(());
-        };
-        let mut sel: Vec<u32> =
-            (0..cache.live.len()).filter(|&s| cache.live[s] && first.holds(s)).map(|s| s as u32).collect();
-        for p in others {
-            sel.retain(|&s| p.holds(s as usize));
         }
-        for s in sel {
+        for s in select(cache, &probes) {
             if !f(cache.view(s as usize))? {
                 break;
             }
@@ -649,10 +735,12 @@ mod tests {
         vec![Value::Str(s.into()), Value::Int(pk), Value::Vector(vec![pk as f32, -1.0]), Value::Int(n)]
     }
 
-    /// The index's TopK equals offering every row, before and after the rows
-    /// are relaid out, through updates and deletes, with and without filters.
+    /// The index's TopK and a filtered scan equal offering every row of a
+    /// model, before and after the rows are relaid out, through updates and
+    /// deletes, with and without filters (`=`, `<>`, a value no row has, two
+    /// predicates).
     #[test]
-    fn indexed_topk_matches_full_scan() {
+    fn indexed_topk_matches_model() {
         let def = TableDef {
             id: 1,
             name: "t".into(),
@@ -713,11 +801,26 @@ mod tests {
             let q = point(qi);
             let k = [1, 5, 10, 50][qi % 4];
             let cat = format!("c{}", qi % 3);
-            let preds: Vec<ColPred<'_>> = if qi % 2 == 1 {
-                vec![ColPred { col: 1, op: CmpOp::Eq, value: PredValue::Str(&cat) }]
-            } else {
-                Vec::new()
+            let preds: Vec<ColPred<'_>> = match qi % 5 {
+                1 => vec![ColPred { col: 1, op: CmpOp::Eq, value: PredValue::Str(&cat) }],
+                2 => vec![ColPred { col: 1, op: CmpOp::Ne, value: PredValue::Str(&cat) }],
+                3 => vec![ColPred { col: 1, op: CmpOp::Eq, value: PredValue::Str("zz") }],
+                4 => vec![
+                    ColPred { col: 1, op: CmpOp::Eq, value: PredValue::Str(&cat) },
+                    ColPred { col: 0, op: CmpOp::Gt, value: PredValue::Int(1500) },
+                ],
+                _ => Vec::new(),
             };
+            let mut want = TopK::new(&q, k);
+            for (&pk, row) in &model {
+                let view = RowView::new(pk, row);
+                if preds.iter().all(|p| p.test(&view)) {
+                    if let Value::Vector(v) = &row[2] {
+                        want.offer(pk, v);
+                    }
+                }
+            }
+            let want = want.into_sorted();
             let mut full = TopK::new(&q, k);
             table
                 .scan_unordered(&log, i64::MIN..=i64::MAX, &preds, |row| {
@@ -729,7 +832,8 @@ mod tests {
                 .unwrap();
             let mut indexed = TopK::new(&q, k);
             table.topk_indexed(&preds, |_| false, |_| true, &mut indexed).unwrap();
-            assert_eq!(indexed.into_sorted(), full.into_sorted(), "query {qi}");
+            assert_eq!(full.into_sorted(), want, "scan, query {qi}");
+            assert_eq!(indexed.into_sorted(), want, "index, query {qi}");
         }
         drop(log);
         let _ = std::fs::remove_dir_all(dir);

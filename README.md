@@ -29,7 +29,7 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Columnar row cache with filter pushdown | done, differential-tested, measured |
 | Docker image (pinned bases, `tests/docker_smoke.sh`) | builds, smoke-tested, benchmarked |
 | Write path: single-pass vector parsing, no re-lexing | done, unit- and differential-tested, measured |
-| Row cache built on first read | done, differential- and crash-tested, measured |
+| Row cache built on first read; dictionary codes for `=`/`<>` on strings | done, unit-, differential- and crash-tested, measured |
 | Wire format, error codes, ready marker | waiting for the official test driver |
 | Exact vector index (k-means lists, triangle-inequality pruning) | done, unit-, differential- and crash-tested, measured |
 | Organizers' public sample cases (`mysqltest/`) | 5/5 pass (`tests/public_cases.py`) |
@@ -156,6 +156,10 @@ unchanged (6.6-6.8 MiB):
 
 The bounds only prune when clusters are tight relative to the distances
 between them; on uniform data or wide clusters the index visits every row.
+
+`=` and `<>` against a constant on a string column compare 4-byte
+dictionary codes rather than strings while the column has at most 1,024
+distinct values.
 
 Environment variables for experiments only: `MVDB_CACHE_BYTES` (row cache
 budget; default a quarter of the cgroup memory limit) and
