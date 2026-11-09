@@ -25,8 +25,9 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Value types, vector literal validation (NaN/Inf/float32 overflow) | done |
 | Append-only commit log with torn-tail recovery | done, crash-tested |
 | Executor: catalog, PK index, row cache, exact TopK, transactions | done, differential-tested |
+| AVX2/FMA distance prefilter (exact results), benchmark harness | done, measured |
 | Wire format, error codes, ready marker | waiting for the official test driver |
-| Vector index (ANN), SIMD tuning, compaction | after correctness |
+| Vector index (ANN), compact in-memory layout, compaction | next |
 
 ## Testing
 
@@ -45,9 +46,44 @@ points, including while a commit is in flight and while recovery is running,
 and checks the recovered contents equal the model's committed state. Set
 `MVDB_FORMAT=jsonl` to get the same machine-readable output by hand.
 
+## Performance
+
+```bash
+cargo build --release
+python3 bench/bench.py                               # write phase, then query phase
+python3 bench/bench.py --env MVDB_DROP_CACHE=0       # same, without page-cache dropping
+```
+
+`bench/bench.py` follows the task's benchmark: 10,000 rows of 128-d vectors
+inserted 100 per commit, then a cold restart and 1,000 TopK queries (K = 10,
+every second one with an equality filter). Each phase runs in its own
+transient systemd unit, so `memory.peak` is read from a real cgroup and
+includes page cache, as on the platform. This machine's user systemd has no
+io controller, so disk I/O comes from `/proc/<pid>/io` instead of
+`io.stat`. Query results are checked for count, duplicates, the filter and
+Recall@10 against distances computed independently in Python. Every run
+appends to `target/bench/results.jsonl`.
+
+TopK first measures each row with a float32 AVX2/FMA kernel (picked at run
+time, scalar fallback otherwise) and computes the exact f64 distance only
+when a proven error bound says the row could still place, so results and
+distances are the same as a full exact scan.
+
+Median of three runs on an i5-9400F, NVMe ext4:
+
+| Phase | T | Peak memory | Disk I/O |
+|---|---|---|---|
+| write (100 commits) | 302 ms | 8.8 MiB | 5.45 MiB written |
+| query (1,000 TopK) | 532 ms | 8.0 MiB | 5.06 MiB read |
+
+Environment variables for experiments only: `MVDB_CACHE_BYTES` (row cache
+budget; default a quarter of the cgroup memory limit) and
+`MVDB_DROP_CACHE=0` (keep log pages in the page cache).
+
 ## Semantics chosen where the task text is silent
 
-To be checked against the official test package when it is published:
+Approved by the student; still to be checked against the official test
+package when it is published:
 
 - DDL and `BEGIN` implicitly commit an open transaction (as in MySQL);
   `COMMIT`/`ROLLBACK` outside a transaction are no-ops.

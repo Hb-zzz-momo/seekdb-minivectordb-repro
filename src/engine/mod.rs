@@ -10,6 +10,7 @@ pub mod expr;
 mod query;
 pub mod result;
 mod table;
+mod topk;
 mod txn;
 
 use std::collections::HashMap;
@@ -34,7 +35,9 @@ pub struct EngineOptions {
 
 impl Default for EngineOptions {
     fn default() -> Self {
-        EngineOptions { log: LogOptions::default(), cache_budget: default_cache_budget() }
+        // MVDB_DROP_CACHE=0 is for benchmarks only.
+        let drop_cache = std::env::var("MVDB_DROP_CACHE").map_or(true, |v| v != "0");
+        EngineOptions { log: LogOptions { drop_cache, ..LogOptions::default() }, cache_budget: default_cache_budget() }
     }
 }
 

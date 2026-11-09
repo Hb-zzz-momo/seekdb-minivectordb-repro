@@ -31,7 +31,7 @@ use crate::{bail, db_err};
 
 const FRAME_HEADER: u64 = 8;
 const PAGE: u64 = 4096;
-const SCAN_BUFFER: usize = 1 << 20;
+const SCAN_BUFFER: usize = 256 << 10;
 
 const OP_CREATE_TABLE: u8 = 1;
 const OP_DROP_TABLE: u8 = 2;
@@ -73,11 +73,14 @@ pub struct LogOptions {
     pub segment_bytes: u64,
     /// `fdatasync` every commit. Only tests turn this off.
     pub sync: bool,
+    /// Drop log pages from the page cache once they are durable or replayed.
+    /// Off only to measure what dropping saves.
+    pub drop_cache: bool,
 }
 
 impl Default for LogOptions {
     fn default() -> Self {
-        LogOptions { segment_bytes: 64 << 20, sync: true }
+        LogOptions { segment_bytes: 64 << 20, sync: true, drop_cache: true }
     }
 }
 
@@ -114,7 +117,7 @@ impl LogStore {
         for (i, &id) in ids.iter().enumerate() {
             let file = OpenOptions::new().read(true).write(true).open(segment_path(dir, id))?;
             let file_len = file.metadata()?.len();
-            let end = scan_segment(&file, id, file_len, &mut payload, |lsn, ops| {
+            let end = scan_segment(&file, id, file_len, opts.drop_cache, &mut payload, |lsn, ops| {
                 last_lsn = lsn;
                 apply(lsn, ops)
             })?;
@@ -126,7 +129,9 @@ impl LogStore {
                 file.set_len(end)?;
                 file.sync_all()?;
             }
-            drop_cache(&file, 0, end);
+            if opts.drop_cache {
+                drop_cache(&file, 0, end);
+            }
             segs.push(Segment { id, file, len: end });
         }
         let mut store = LogStore {
@@ -168,7 +173,7 @@ impl LogStore {
         // the container's memory). Keep the partial last page: the next
         // append writes into it and would otherwise have to read it back.
         let keep_from = seg.len & !(PAGE - 1);
-        if keep_from > self.dropped_upto {
+        if keep_from > self.dropped_upto && self.opts.drop_cache {
             drop_cache(&seg.file, self.dropped_upto, keep_from - self.dropped_upto);
             self.dropped_upto = keep_from;
         }
@@ -195,11 +200,11 @@ impl LogStore {
     pub fn scan(&self, mut f: impl FnMut(u64, &[OpView<'_>]) -> DbResult<()>) -> DbResult<()> {
         let mut payload = Vec::new();
         for seg in &self.segs {
-            let end = scan_segment(&seg.file, seg.id, seg.len, &mut payload, &mut f)?;
+            let end = scan_segment(&seg.file, seg.id, seg.len, self.opts.drop_cache, &mut payload, &mut f)?;
             if end != seg.len {
                 bail!(Corrupt, "segment {} changed under a scan", seg.id);
             }
-            if seg.id != self.active_id() {
+            if seg.id != self.active_id() && self.opts.drop_cache {
                 drop_cache(&seg.file, 0, seg.len);
             }
         }
@@ -337,10 +342,11 @@ fn scan_segment(
     file: &File,
     seg: u32,
     limit: u64,
+    drop_behind: bool,
     payload: &mut Vec<u8>,
     mut f: impl FnMut(u64, &[OpView<'_>]) -> DbResult<()>,
 ) -> DbResult<u64> {
-    let mut reader = BufReader::with_capacity(SCAN_BUFFER, PosReader { file, pos: 0 });
+    let mut reader = BufReader::with_capacity(SCAN_BUFFER, PosReader { file, pos: 0, drop_behind, dropped: 0 });
     let mut off = 0u64;
     while off + FRAME_HEADER <= limit {
         let mut header = [0u8; FRAME_HEADER as usize];
@@ -363,14 +369,25 @@ fn scan_segment(
 }
 
 /// `Read` over a shared `File` using positional reads, so scans never move
-/// the file cursor.
+/// the file cursor. With `drop_behind`, pages before the read position are
+/// dropped from the page cache as the scan goes, so a replay holds at most
+/// about one buffer of the log in cache instead of a whole segment.
 struct PosReader<'a> {
     file: &'a File,
     pos: u64,
+    drop_behind: bool,
+    dropped: u64,
 }
 
 impl Read for PosReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.drop_behind {
+            let upto = self.pos & !(PAGE - 1);
+            if upto > self.dropped {
+                drop_cache(self.file, self.dropped, upto - self.dropped);
+                self.dropped = upto;
+            }
+        }
         let n = self.file.read_at(buf, self.pos)?;
         self.pos += n as u64;
         Ok(n)
@@ -418,7 +435,7 @@ mod tests {
     }
 
     fn opts() -> LogOptions {
-        LogOptions { segment_bytes: 64 << 20, sync: false }
+        LogOptions { segment_bytes: 64 << 20, sync: false, drop_cache: true }
     }
 
     fn table() -> TableDef {
@@ -546,7 +563,7 @@ mod tests {
     #[test]
     fn segments_roll_over() {
         let dir = TempDir::new();
-        let o = LogOptions { segment_bytes: 200, sync: false };
+        let o = LogOptions { segment_bytes: 200, sync: false, drop_cache: true };
         let (mut log, _) = replay(&dir.0, o.clone());
         let mut locs = Vec::new();
         for pk in 0..20 {
@@ -589,7 +606,7 @@ mod tests {
     #[test]
     fn damaged_older_segment_is_an_error() {
         let dir = TempDir::new();
-        let o = LogOptions { segment_bytes: 100, sync: false };
+        let o = LogOptions { segment_bytes: 100, sync: false, drop_cache: true };
         let (mut log, _) = replay(&dir.0, o.clone());
         for pk in 0..6 {
             log.append(&[put(pk, 1, 60)]).unwrap();

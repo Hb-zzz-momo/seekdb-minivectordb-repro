@@ -56,6 +56,19 @@
       "source": "agent",
       "kind": "summary",
       "content": "Committed the scaffold, then built the executor: per-table primary-key index into the log plus a row cache (vectors packed contiguously) while under a memory budget of a quarter of the cgroup limit, else rows are read from the log. Every statement writes to a transaction overlay with an undo list; a failed statement replays its undo; COMMIT writes the overlay as one log frame. Where the task text is silent it followed MySQL: DDL and BEGIN implicitly commit. Other open choices (to check against the official package): UPDATE SET values are validated even if no row matches; number/string comparisons are type errors; unordered results come in pk order. Wrote tests/difftest.py: random sessions compared against a Python reference model, with an optional kill -9 mode. Vector components are multiples of 1/4 so both sides compute distances exactly and tie-breaking by pk is tested without float noise."
+    },
+    {
+      "id": "c9",
+      "date": "2026-11-09",
+      "source": "student",
+      "content": "Start performance\n\nThe progress is fantastic, and all four architectural decisions (DDL autocommit, strict type checking, no implicit string conversions, and PK order) are fully approved.\nLet's start the Performance Phase:\n\n1. Implement hand-written AVX2 SIMD routines for the 128-dimensional L2 distance calculation to minimize query latency.\n2. Build the benchmark harness to measure execution time, cgroup peak memory (memory.peak), and disk I/O (io.stat), verifying our earlier prediction on posix_fadvise page cache savings.\n\nLet's sprint for the top performance score!"
+    },
+    {
+      "id": "c10",
+      "date": "2026-11-09",
+      "source": "agent",
+      "kind": "summary",
+      "content": "Built bench/bench.py after the spec's section 3.3 (write phase from an empty table, 100 rows per commit; cold restart, warmup, 1,000 TopK queries, half filtered). Each phase runs in its own systemd user unit to read memory.peak from a real cgroup; this machine's user manager has no io controller, so I/O comes from /proc/<pid>/io, not io.stat. Added an AVX2/FMA float32 kernel used only as a prefilter: a row gets its exact f64 distance only if a proven error bound says it could still enter the TopK, so results stay identical to an exact scan. The fadvise prediction held for the write phase but not for the query phase, where peak memory is reached during recovery, before the old end-of-replay drop; recovery now drops pages as it reads. One mistake on the way: the first re-measurement ran a stale release binary (cargo test does not rebuild it) and showed no change; the harness now refuses a binary older than the sources."
     }
   ],
   "decisions": [
@@ -69,7 +82,21 @@
       "chosen": "A",
       "chosen_by": "student",
       "rationale_ref": "/conversations/4/content",
-      "status": "planned; not yet measured"
+      "status": "implemented; write/recovery memory and I/O measured in e5, e9, e10"
+    },
+    {
+      "id": "d2",
+      "topic": "semantics where the task text is silent (README list)",
+      "options": [
+        "DDL and BEGIN implicitly commit",
+        "UPDATE SET values validated even when no row matches",
+        "number/string comparison and cross-type storage are type errors, no implicit conversion",
+        "rows without ORDER BY in primary-key order"
+      ],
+      "chosen": "all four as implemented",
+      "chosen_by": "student",
+      "rationale_ref": "/conversations/8/content",
+      "status": "approved; to re-check against the official package"
     }
   ],
   "experiments": [
@@ -104,12 +131,76 @@
       "purpose": "Crash mode: kill -9 at random points, including during recovery, then compare the recovered data with the model. A first run (--seeds 200:230) passed, but no kill landed before an in-flight commit became durable (118 crash:committed, 363 crash:no-op, no lost-uncommitted case), so the kill delays were shortened and the run repeated.",
       "command": "python3 tests/difftest.py --seeds 200:240 --steps 400 --crash --stats",
       "output": "      66  crash:committed\n      75  crash:lost-uncommitted\n     497  crash:no-op\n40/40 seeds passed\ntorn tails discarded on recovery: 0"
+    },
+    {
+      "id": "e5",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Test the prediction that dropping log pages from the page cache lowers peak memory without costing I/O. Three runs with dropping on, three with MVDB_DROP_CACHE=0. M_peak across runs: write on 8.79/8.78/8.81, off 13.98/13.99/13.99 MiB; query on 13.55/13.74/13.68, off 13.68/13.56/13.56 MiB. Output: first run of each.",
+      "command": "python3 bench/bench.py --label fadvise-on; python3 bench/bench.py --env MVDB_DROP_CACHE=0 --label fadvise-off",
+      "output": "write  T=   306.3 ms  ready=  16.9 ms  M_peak=  8.79 MiB (end: anon 8.40, file 0.00)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.22s (sys 0.02)\nquery  T=   853.4 ms  ready=  28.8 ms  M_peak= 13.55 MiB (end: anon 7.32, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.83s (sys 0.02)  recall f=1.0000 u=1.0000\n--- MVDB_DROP_CACHE=0\nwrite  T=   337.5 ms  ready=  15.6 ms  M_peak= 13.98 MiB (end: anon 8.40, file 5.06)  B=   5.45 MiB (r 0.00, w 5.45)  cpu=0.22s (sys 0.01)\nquery  T=   831.7 ms  ready=  28.4 ms  M_peak= 13.68 MiB (end: anon 7.32, file 5.06)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.81s (sys 0.01)  recall f=1.0000 u=1.0000"
+    },
+    {
+      "id": "e6",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Distance kernel speed alone, 10,000 x 128 floats, 50 passes.",
+      "command": "cargo test --release -- --ignored --nocapture kernel_speed",
+      "output": "f64 reference    78.5 ns/row  (10441887.0)\nf32 dispatch     20.0 ns/row  (10441887.0)\nf32 scalar      112.8 ns/row  (10441887.0)"
+    },
+    {
+      "id": "e7",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Check that the error margin in the float32 prefilter is needed and tested: a mutant whose cutoff is the bare K-th squared distance (no margin) against the near-tie unit test. The real build passes 31 unit tests, difftest seeds 0:40 and crash seeds 400:420.",
+      "command": "mutant: F32Bound::cutoff returns dist * dist; cargo test --release topk",
+      "output": "thread 'engine::topk::tests::near_ties_match_brute_force' (472065) panicked at src/engine/topk.rs:150:17:\nassertion `left == right` failed: round 4 dim 3 k 50"
+    },
+    {
+      "id": "e8",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Query phase with the AVX2 prefilter, three runs, also selecting the distance to compare it with the Python reference (before: 853.4/832.5/832.7 ms, e5). T of the other runs: 520.4, 508.7 ms.",
+      "command": "python3 bench/bench.py --label avx2-prefilter --with-distance",
+      "output": "query  T=   535.4 ms  ready=  27.1 ms  M_peak= 13.59 MiB (end: anon 7.34, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.50s (sys 0.01)  recall f=1.0000 u=1.0000 dist_err=2.5e-16"
+    },
+    {
+      "id": "e9",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Find where the query-phase peak comes from. The harness showed the peak is already reached at the ready line; sampling the cgroup during startup showed page cache growing to the whole log during replay (that run still used a stale binary without the drop-behind change). After rebuilding, three query runs; M_peak 7.91/8.04/7.95 MiB.",
+      "command": "cgroup memory.stat sampling during startup; then python3 bench/bench.py --label recovery-drop-behind",
+      "output": "max sampled: {'anon': 7.76, 'file': 5.06, 'kernel': 0.12, 'sock': 0.0, 'shmem': 0.0, 'file_mapped': 0.0, 'cur': 13.19} at 29.9 ms\nquery  T=   532.2 ms  ready=  22.9 ms  M_peak=  7.91 MiB (end: anon 7.32, file 0.00)  B=   5.06 MiB (r 5.06, w 0.00)  cpu=0.50s (sys 0.01)  peak@ready=7.91 peak@warm=7.91  recall f=1.0000 u=1.0000"
+    },
+    {
+      "id": "e10",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "The c6 prediction for a streaming scan that drops what it read (about 5 GB of reads for 1,000 queries). Row cache off (MVDB_CACHE_BYTES=0): first with the page cache kept (1,000 queries), then with the driver dropping the data files from the page cache after every query (100 queries).",
+      "command": "python3 bench/bench.py --env MVDB_CACHE_BYTES=0; python3 bench/bench.py --phase query --queries 100 --env MVDB_CACHE_BYTES=0 --drop-between-queries",
+      "output": "query  T=  9895.9 ms  ready=  26.2 ms  M_peak=  6.02 MiB (end: anon 0.82, file 5.06)  B=  10.12 MiB (r 10.12, w 0.00)  cpu=9.98s (sys 5.39)  peak@ready=1.74 peak@warm=6.02  recall f=1.0000 u=1.0000\nquery  T=  1359.6 ms  ready=  22.2 ms  M_peak=  6.27 MiB (end: anon 0.82, file 0.00)  B= 510.92 MiB (r 510.92, w 0.00)  cpu=1.33s (sys 0.79)  peak@ready=1.72 peak@warm=6.02  recall f=1.0000 u=1.0000"
+    },
+    {
+      "id": "e11",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Split the write phase (engine alone, 12,354,604 bytes of SQL): the same INSERTs into a missing table stop right after lexing and parsing.",
+      "command": "/usr/bin/time minivectordb < w_parse.sql; /usr/bin/time minivectordb < w.sql",
+      "output": "w_parse: 0.12 s wall, 0.10 user, 0.00 sys\nw_parse: 0.11 s wall, 0.10 user, 0.00 sys\nw: 0.28 s wall, 0.17 user, 0.03 sys\nw: 0.28 s wall, 0.18 user, 0.03 sys"
+    },
+    {
+      "id": "e12",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Crash and differential tests on the rebuilt binary after the recovery change.",
+      "command": "python3 tests/difftest.py --seeds 500:540 --steps 400 --crash --stats; python3 tests/difftest.py --seeds 0:30 --steps 400",
+      "output": "      84  crash:committed\n      70  crash:lost-uncommitted\n     513  crash:no-op\n40/40 seeds passed\n30/30 seeds passed"
     }
   ],
   "retrospective": [],
   "limitations": [
     "The wire format, error codes and ready marker are placeholders; the official test driver was not published at the time of writing.",
-    "No performance measurement has been taken yet; the I/O and memory reasoning in c6 is a prediction.",
+    "Benchmarks ran on one desktop machine (i5-9400F, NVMe ext4), outside Docker. I/O is from /proc/<pid>/io, not the platform's io.stat, and excludes filesystem journal writes.",
     "The reference model was written from the same reading of the task as the engine, so it finds implementation bugs but cannot catch a shared misreading of the rules."
   ]
 }

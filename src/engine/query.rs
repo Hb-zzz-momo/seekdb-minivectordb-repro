@@ -2,19 +2,18 @@
 //! transaction (committed rows with the transaction's own changes on top).
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::ops::RangeInclusive;
 
 use super::expr::{compile, compile_filter, literal_value, pk_range, CExpr, Kind, Scope};
 use super::result::{cmp_cells, Cell, ExecResult};
 use super::table::{RowView, Table, ValRef};
+use super::topk::TopK;
 use super::txn::{Changes, Txn};
 use super::Tables;
 use crate::error::DbResult;
 use crate::sql::ast::{Delete, Expr, Insert, Literal, Select, SelectItem, Update};
 use crate::storage::log::LogStore;
 use crate::types::Value;
-use crate::vector::l2_distance;
 use crate::{bail, db_err};
 
 /// Visits visible rows with pk in `range`, in pk order, until `f` returns
@@ -185,24 +184,6 @@ pub(super) fn delete(log: &LogStore, tables: &Tables, txn: &mut Txn, del: &Delet
     Ok(ExecResult::ok(doomed.len() as u64))
 }
 
-/// Distance ordered by `total_cmp`; distances are never NaN.
-#[derive(PartialEq)]
-struct Dist(f64);
-
-impl Eq for Dist {}
-
-impl PartialOrd for Dist {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Dist {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
-    }
-}
-
 pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select) -> DbResult<ExecResult> {
     let id = tables.lookup(&sel.table)?;
     let table = tables.table(id)?;
@@ -275,28 +256,20 @@ pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select) -
     }
     let passes = |row: &RowView<'_>| filter.as_ref().is_none_or(|f| f.test(row));
 
-    // TopK: ORDER BY L2_DISTANCE(...) ASC LIMIT k keeps a bounded max-heap of
-    // (distance, pk); ties on distance go to the smaller pk.
+    // TopK: ORDER BY L2_DISTANCE(...) ASC LIMIT k; ties go to the smaller pk.
     if let ([(CExpr::Dist { col, query }, false)], Some(limit)) = (order.as_slice(), limit) {
-        let k = offset.saturating_add(limit);
-        let mut heap: BinaryHeap<(Dist, i64)> = BinaryHeap::new();
+        let mut top = TopK::new(query, offset.saturating_add(limit));
         scan_visible(table, log, changes, range, &mut |row| {
-            if !passes(&row) {
-                return Ok(true);
-            }
-            let ValRef::Vector(v) = row.get(*col) else { return Ok(true) };
-            let key = (Dist(l2_distance(v, query)), row.pk);
-            if heap.len() < k {
-                heap.push(key);
-            } else if heap.peek().is_some_and(|top| key < *top) {
-                heap.pop();
-                heap.push(key);
+            if passes(&row) {
+                if let ValRef::Vector(v) = row.get(*col) {
+                    top.offer(row.pk, v);
+                }
             }
             Ok(true)
         })?;
         let vec_col = def.vector_column();
         let mut rows = Vec::new();
-        for (_, pk) in heap.into_sorted_vec().into_iter().skip(offset) {
+        for pk in top.into_sorted().into_iter().skip(offset) {
             let values = get_visible(table, log, changes, pk)?
                 .ok_or_else(|| db_err!(Internal, "row {} vanished during a query", pk))?;
             let view = RowView::new(pk, &values, vec_col);
