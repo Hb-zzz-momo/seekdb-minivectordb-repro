@@ -26,6 +26,11 @@ fn is_reserved(word: &str) -> bool {
     RESERVED.iter().any(|r| r.eq_ignore_ascii_case(word))
 }
 
+/// True if `sql` holds only whitespace and comments.
+pub fn is_blank(sql: &str) -> bool {
+    tokenize(sql).is_ok_and(|t| t.len() == 1)
+}
+
 /// Parses one statement; a trailing `;` is allowed.
 pub fn parse(sql: &str) -> DbResult<Statement> {
     let toks = tokenize(sql)?;

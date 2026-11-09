@@ -10,6 +10,10 @@ pub enum ErrorKind {
     NoSuchTable,
     NoSuchColumn,
     DuplicateKey,
+    /// INSERT row has a different number of values than target columns.
+    ColumnCount,
+    /// INSERT column list leaves out a column (there are no defaults).
+    NoDefault,
     TypeMismatch,
     OutOfRange,
     DataTooLong,

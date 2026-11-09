@@ -43,6 +43,19 @@
       "source": "agent",
       "kind": "summary",
       "content": "Agreed with A and raised one problem with the scan plan: in the benchmark the whole vector set is about 10,000 x 128 x 4 B = 5 MB; if every one of the 1,000 queries streams it from disk after DONTNEED dropped the cache, that is about 5 GB of physical reads, which the I/O metric counts. Proposed instead: keep a compact in-memory copy while a table fits a memory budget, stream with DONTNEED only above it; on the write path drop pages after fdatasync except the partial last page, which the next append would otherwise read back. Also noted that the rules rank the final version at the deadline by the performance metric and do not break ties by submission time."
+    },
+    {
+      "id": "c7",
+      "date": "2026-11-09",
+      "source": "student",
+      "content": "Yes, please commit this scaffold first, and then proceed directly with the executor. Do not worry about Docker for now—we will test the Docker build later.\nProceed with:\n\n1. Commit the current passing code with a clean commit message.\n2. Implement the Executor (table catalog, in-memory PK index, streaming TopK with SIMD distance, transactions with BEGIN/COMMIT/ROLLBACK and statement-level undo).\n3. Start the differential test harness against the Python reference model.\n\nLet's keep moving!\n\nDocker is now installed and verified. Please commit the current scaffold first, and then proceed with the executor and test harness."
+    },
+    {
+      "id": "c8",
+      "date": "2026-11-09",
+      "source": "agent",
+      "kind": "summary",
+      "content": "Committed the scaffold, then built the executor: per-table primary-key index into the log plus a row cache (vectors packed contiguously) while under a memory budget of a quarter of the cgroup limit, else rows are read from the log. Every statement writes to a transaction overlay with an undo list; a failed statement replays its undo; COMMIT writes the overlay as one log frame. Where the task text is silent it followed MySQL: DDL and BEGIN implicitly commit. Other open choices (to check against the official package): UPDATE SET values are validated even if no row matches; number/string comparisons are type errors; unordered results come in pk order. Wrote tests/difftest.py: random sessions compared against a Python reference model, with an optional kill -9 mode. Vector components are multiples of 1/4 so both sides compute distances exactly and tie-breaking by pk is tested without float noise."
     }
   ],
   "decisions": [
@@ -67,11 +80,36 @@
       "purpose": "Unit tests for lexer, parser, vector literal validation, row codec and commit log, including recovery after cutting the log at every byte offset inside the last frame.",
       "command": "cargo test",
       "output": "test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s"
+    },
+    {
+      "id": "e2",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Differential test of the executor against the Python reference model. The first run (--seeds 0:30 --steps 300) passed but showed a lopsided workload: 860 insert:error:DataTooLong against 1021 insert:ok, and 1871 SELECTs with 0 rows. String lengths and the table-drop rate were retuned and the run repeated (excerpt of the --stats counters; rows=3 means 3 or more).",
+      "command": "python3 tests/difftest.py --seeds 0:30 --steps 400 --stats",
+      "output": "     208  insert:error:DataTooLong\n    1871  insert:ok\n    2127  select:rows=0\n     636  select:rows=1\n     403  select:rows=2\n     825  select:rows=3\n30/30 seeds passed"
+    },
+    {
+      "id": "e3",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Check the tester can fail: two deliberately broken builds (statement undo disabled; TopK heap keeping the farthest rows). Excerpt of the first divergence reported for each.",
+      "command": "difftest against two mutant builds",
+      "output": "== mutant: no statement undo\n  expected: {\"ok\": true, \"affected\": 6}\n  got:      {\"ok\": true, \"affected\": 7}\n== mutant: TopK keeps farthest\n  expected: {\"columns\": [\"id\", \"distance\"], \"rows\": [[28, 3.010398644698074], [-3, 3.766629793329841], [2, 3.766629793329841]]}\n  got:      {\"columns\": [\"id\", \"distance\"], \"rows\": [[2, 3.766629793329841], [6, 3.766629793329841], [25, 3.766629793329841]]}"
+    },
+    {
+      "id": "e4",
+      "date": "2026-11-09",
+      "source": "tool",
+      "purpose": "Crash mode: kill -9 at random points, including during recovery, then compare the recovered data with the model. A first run (--seeds 200:230) passed, but no kill landed before an in-flight commit became durable (118 crash:committed, 363 crash:no-op, no lost-uncommitted case), so the kill delays were shortened and the run repeated.",
+      "command": "python3 tests/difftest.py --seeds 200:240 --steps 400 --crash --stats",
+      "output": "      66  crash:committed\n      75  crash:lost-uncommitted\n     497  crash:no-op\n40/40 seeds passed\ntorn tails discarded on recovery: 0"
     }
   ],
   "retrospective": [],
   "limitations": [
-    "Executor, transactions and the wire format are not implemented yet; the official test driver was not published at the time of writing.",
-    "No performance measurement has been taken yet; the I/O and memory reasoning in c6 is a prediction."
+    "The wire format, error codes and ready marker are placeholders; the official test driver was not published at the time of writing.",
+    "No performance measurement has been taken yet; the I/O and memory reasoning in c6 is a prediction.",
+    "The reference model was written from the same reading of the task as the engine, so it finds implementation bugs but cannot catch a shared misreading of the rules."
   ]
 }

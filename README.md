@@ -24,9 +24,40 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Lexer and parser for the SQL subset | done, unit-tested |
 | Value types, vector literal validation (NaN/Inf/float32 overflow) | done |
 | Append-only commit log with torn-tail recovery | done, crash-tested |
-| Executor, transactions, PK index | next |
+| Executor: catalog, PK index, row cache, exact TopK, transactions | done, differential-tested |
 | Wire format, error codes, ready marker | waiting for the official test driver |
-| Vector index (ANN) | after correctness |
+| Vector index (ANN), SIMD tuning, compaction | after correctness |
+
+## Testing
+
+```bash
+cargo test
+cargo build --release
+python3 tests/difftest.py --seeds 0:100 --steps 400            # results vs reference model
+python3 tests/difftest.py --seeds 0:100 --steps 400 --crash    # plus kill -9 and recovery
+```
+
+`tests/difftest.py` generates random sessions (DDL, multi-row INSERT with
+duplicate keys and invalid values, UPDATE, DELETE, filtered SELECT, TopK,
+BEGIN/COMMIT/ROLLBACK) and compares every result with a reference model
+written in Python. In `--crash` mode it also kills the database at random
+points, including while a commit is in flight and while recovery is running,
+and checks the recovered contents equal the model's committed state. Set
+`MVDB_FORMAT=jsonl` to get the same machine-readable output by hand.
+
+## Semantics chosen where the task text is silent
+
+To be checked against the official test package when it is published:
+
+- DDL and `BEGIN` implicitly commit an open transaction (as in MySQL);
+  `COMMIT`/`ROLLBACK` outside a transaction are no-ops.
+- `UPDATE ... SET` values are validated before any row is matched, so a bad
+  value is an error even when no row matches.
+- Comparing a number with a string, or storing a number in a VARCHAR/VECTOR
+  column (or a string in BIGINT), is a type error rather than an implicit
+  conversion. A decimal literal stored in BIGINT must be integral.
+- Rows without ORDER BY come back in primary-key order.
+- Table and column names are case-insensitive.
 
 ## Storage design
 
