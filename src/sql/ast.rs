@@ -114,5 +114,6 @@ pub enum Expr {
     /// Function call; `name` is upper-cased.
     Func { name: String, args: Vec<Expr> },
     Cmp { op: CmpOp, left: Box<Expr>, right: Box<Expr> },
-    And(Box<Expr>, Box<Expr>),
+    /// Conjunction of two or more conditions, none of them an `And`.
+    And(Vec<Expr>),
 }

@@ -24,7 +24,8 @@ pub enum CExpr {
     /// `L2_DISTANCE` of two constants.
     ConstDist(f64),
     Cmp(CmpOp, Box<CExpr>, Box<CExpr>),
-    And(Box<CExpr>, Box<CExpr>),
+    /// Holds when every condition holds; none of them is an `And`.
+    And(Vec<CExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,13 +78,16 @@ pub fn compile(e: &Expr, scope: &Scope<'_>) -> DbResult<CExpr> {
             }
             CExpr::Cmp(*op, Box::new(l), Box::new(r))
         }
-        Expr::And(a, b) => {
-            let a = compile(a, scope)?;
-            let b = compile(b, scope)?;
-            if a.kind(scope.def) != Kind::Bool || b.kind(scope.def) != Kind::Bool {
-                bail!(Unsupported, "AND operands must be conditions");
+        Expr::And(terms) => {
+            let mut all = Vec::with_capacity(terms.len());
+            for t in terms {
+                match compile(t, scope)? {
+                    CExpr::And(inner) => all.extend(inner),
+                    c if c.kind(scope.def) == Kind::Bool => all.push(c),
+                    _ => bail!(Unsupported, "AND operands must be conditions"),
+                }
             }
-            CExpr::And(Box::new(a), Box::new(b))
+            CExpr::And(all)
         }
     })
 }
@@ -184,7 +188,7 @@ impl CExpr {
     pub fn test(&self, row: &RowView<'_>) -> bool {
         match self {
             CExpr::Cmp(op, l, r) => holds(*op, compare(&l.scalar(row), &r.scalar(row))),
-            CExpr::And(a, b) => a.test(row) && b.test(row),
+            CExpr::And(terms) => terms.iter().all(|e| e.test(row)),
             _ => false,
         }
     }
@@ -249,9 +253,10 @@ impl ColPred<'_> {
 pub fn split_filter(filter: Option<&CExpr>) -> (Vec<ColPred<'_>>, Vec<&CExpr>) {
     fn walk<'a>(e: &'a CExpr, preds: &mut Vec<ColPred<'a>>, rest: &mut Vec<&'a CExpr>) {
         match e {
-            CExpr::And(a, b) => {
-                walk(a, preds, rest);
-                walk(b, preds, rest);
+            CExpr::And(terms) => {
+                for e in terms {
+                    walk(e, preds, rest);
+                }
             }
             CExpr::Cmp(op, l, r) => {
                 let (col, op, lit) = match (&**l, &**r) {
@@ -292,9 +297,10 @@ fn compare(a: &Scalar<'_>, b: &Scalar<'_>) -> Ordering {
 pub fn pk_range(filter: Option<&CExpr>, pk: usize) -> Option<RangeInclusive<i64>> {
     fn walk(e: &CExpr, pk: usize, lo: &mut i64, hi: &mut i64, empty: &mut bool) {
         match e {
-            CExpr::And(a, b) => {
-                walk(a, pk, lo, hi, empty);
-                walk(b, pk, lo, hi, empty);
+            CExpr::And(terms) => {
+                for e in terms {
+                    walk(e, pk, lo, hi, empty);
+                }
             }
             CExpr::Cmp(op, l, r) => {
                 let (op, v) = match (&**l, &**r) {

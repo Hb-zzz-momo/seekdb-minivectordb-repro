@@ -26,7 +26,6 @@ fn is_reserved(word: &str) -> bool {
     RESERVED.iter().any(|r| r.eq_ignore_ascii_case(word))
 }
 
-/// True if `sql` holds only whitespace and comments.
 /// True if `sql` holds only whitespace and complete comments.
 pub fn is_blank(sql: &str) -> bool {
     matches!(skip_space(sql, 0), Ok(i) if i == sql.len())
@@ -38,7 +37,7 @@ pub fn parse(sql: &str) -> DbResult<Statement> {
     if toks[0].tok == Tok::Eof {
         bail!(Syntax, "empty statement");
     }
-    let mut p = Parser { src: sql, toks, pos: 0 };
+    let mut p = Parser { src: sql, toks, pos: 0, depth: 0 };
     let stmt = p.statement()?;
     while p.eat(&Tok::Semicolon) {}
     if !p.at(&Tok::Eof) {
@@ -47,10 +46,17 @@ pub fn parse(sql: &str) -> DbResult<Statement> {
     Ok(stmt)
 }
 
+/// How deeply expressions may nest (parentheses, function arguments). Each
+/// level is a few stack frames of recursive descent, so the limit is what
+/// keeps adversarial input from overflowing the stack.
+pub const MAX_DEPTH: usize = 128;
+
 struct Parser<'a> {
     src: &'a str,
     toks: Vec<Token>,
     pos: usize,
+    /// Expressions currently being parsed, innermost included.
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -598,17 +604,33 @@ impl Parser<'_> {
     }
 
     fn expr(&mut self) -> DbResult<Expr> {
-        let mut left = self.comparison()?;
-        loop {
-            if self.eat_kw("AND") {
-                let right = self.comparison()?;
-                left = Expr::And(Box::new(left), Box::new(right));
-            } else if self.is_any_kw(&["OR", "XOR"]) {
-                return Err(self.unsupported("OR"));
-            } else {
-                return Ok(left);
-            }
+        if self.depth == MAX_DEPTH {
+            bail!(Syntax, "expression nested more than {} levels deep", MAX_DEPTH);
         }
+        self.depth += 1;
+        let e = self.conjunction();
+        self.depth -= 1;
+        e
+    }
+
+    /// `comparison [AND comparison]...` as one flat list, which nested
+    /// parenthesized conjunctions join, so no AND chain is deeper than one
+    /// level however long it is.
+    fn conjunction(&mut self) -> DbResult<Expr> {
+        let mut e = self.comparison()?;
+        if self.is_kw("AND") {
+            let mut terms = Vec::new();
+            push_conjunct(&mut terms, e);
+            while self.eat_kw("AND") {
+                let next = self.comparison()?;
+                push_conjunct(&mut terms, next);
+            }
+            e = Expr::And(terms);
+        }
+        if self.is_any_kw(&["OR", "XOR"]) {
+            return Err(self.unsupported("OR"));
+        }
+        Ok(e)
     }
 
     fn comparison(&mut self) -> DbResult<Expr> {
@@ -723,6 +745,13 @@ impl Parser<'_> {
             }
             _ => Err(self.unexpected()),
         }
+    }
+}
+
+fn push_conjunct(terms: &mut Vec<Expr>, e: Expr) {
+    match e {
+        Expr::And(inner) => terms.extend(inner),
+        e => terms.push(e),
     }
 }
 
@@ -889,6 +918,39 @@ mod tests {
         assert_eq!(kind("TRUNCATE TABLE t"), ErrorKind::Unsupported);
         assert_eq!(kind("DELETE FROM t LIMIT 1"), ErrorKind::Unsupported);
         assert_eq!(kind("   -- only a comment"), ErrorKind::Syntax);
+    }
+
+    fn filter(sql: &str) -> Expr {
+        let Statement::Select(sel) = parse(sql).unwrap() else { panic!() };
+        sel.filter.unwrap()
+    }
+
+    #[test]
+    fn conjunctions_are_flat() {
+        let eq = |c: &str, v: i64| Expr::Cmp {
+            op: CmpOp::Eq,
+            left: Box::new(col(c)),
+            right: Box::new(Expr::Lit(Literal::Int(v))),
+        };
+        assert_eq!(
+            filter("SELECT * FROM t WHERE (a = 1 AND (b = 2 AND c = 3)) AND d = 4"),
+            Expr::And(vec![eq("a", 1), eq("b", 2), eq("c", 3), eq("d", 4)])
+        );
+        assert_eq!(filter("SELECT * FROM t WHERE ((a = 1))"), eq("a", 1));
+        let long = vec!["a = 1"; 100_000].join(" AND ");
+        let Expr::And(terms) = filter(&format!("SELECT * FROM t WHERE {long}")) else { panic!() };
+        assert_eq!(terms.len(), 100_000);
+    }
+
+    #[test]
+    fn nesting_is_limited() {
+        let nest = |n: usize| format!("SELECT * FROM t WHERE {}a = 1{}", "(".repeat(n), ")".repeat(n));
+        assert!(parse(&nest(MAX_DEPTH - 1)).is_ok());
+        assert_eq!(kind(&nest(MAX_DEPTH)), ErrorKind::Syntax);
+        assert_eq!(kind(&nest(100_000)), ErrorKind::Syntax);
+        let calls = |n: usize| format!("SELECT {}v{} FROM t", "L2_DISTANCE(".repeat(n), ", '[1]')".repeat(n));
+        assert!(parse(&calls(MAX_DEPTH - 1)).is_ok());
+        assert_eq!(kind(&calls(10_000)), ErrorKind::Syntax);
     }
 
     #[test]
