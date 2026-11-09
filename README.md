@@ -31,6 +31,7 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Write path: single-pass vector parsing, no re-lexing | done, unit- and differential-tested, measured |
 | Wire format, error codes, ready marker | waiting for the official test driver |
 | Exact vector index (k-means lists, triangle-inequality pruning) | done, unit-, differential- and crash-tested, measured |
+| Organizers' public sample cases (`mysqltest/`) | 5/5 pass (`tests/public_cases.py`) |
 | Approximate (ANN) mode, log compaction | next |
 
 ## Testing
@@ -41,7 +42,13 @@ cargo build --release
 python3 tests/difftest.py --seeds 0:100 --steps 400            # results vs reference model
 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash    # plus kill -9 and recovery
 MVDB_IVF_MIN_ROWS=1 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash   # vector index on every table
+python3 tests/public_cases.py                                   # the organizers' sample cases in mysqltest/
 ```
+
+`tests/public_cases.py` runs each case listed in `mysqltest/manifest.json`
+on a fresh data directory and checks every result against its `.result`
+assertions as `mysqltest/README.md` describes them (exact integers, strings
+and column names; floats within 1e-5; `unordered` as a multiset).
 
 `tests/difftest.py` generates random sessions (DDL, multi-row INSERT with
 duplicate keys and invalid values, UPDATE, DELETE, filtered SELECT, TopK,
@@ -152,7 +159,10 @@ used; the differential tests set it to 1).
 ## Semantics chosen where the task text is silent
 
 Approved by the student; still to be checked against the official test
-package when it is published:
+package when it is published. The organizers' public cases (`mysqltest/`)
+touch none of these; they do confirm that ORDER BY ties go to the smaller
+primary key (also under `DESC`), that strings compare by code point, and
+that `L2_DISTANCE` is the distance, not its square.
 
 - DDL and `BEGIN` implicitly commit an open transaction (as in MySQL);
   `COMMIT`/`ROLLBACK` outside a transaction are no-ops.
