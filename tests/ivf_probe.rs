@@ -64,16 +64,17 @@ fn top10(cands: impl Iterator<Item = usize>, data: &[f32], q: &[f32]) -> Vec<usi
     v.into_iter().take(10).map(|(_, i)| i).collect()
 }
 
-fn run(name: &str, clustered: bool) {
+fn run(name: &str, sigma: Option<f32>) {
     let (n, lists, queries) = (10_000, 100, 300);
-    let mut rng = Rng(if clustered { 7 } else { 1 });
+    let mut rng = Rng(if sigma.is_some() { 7 } else { 1 });
     let centers: Vec<Vec<f32>> = (0..50).map(|_| (0..DIM).map(|_| rng.unit()).collect()).collect();
     let point = |rng: &mut Rng| -> Vec<f32> {
-        if clustered {
-            let c = &centers[rng.below(centers.len())];
-            c.iter().map(|x| x + rng.gauss() * 0.15).collect()
-        } else {
-            (0..DIM).map(|_| rng.unit()).collect()
+        match sigma {
+            Some(s) => {
+                let c = &centers[rng.below(centers.len())];
+                c.iter().map(|x| x + rng.gauss() * s).collect()
+            }
+            None => (0..DIM).map(|_| rng.unit()).collect(),
         }
     };
     let data: Vec<f32> = (0..n).flat_map(|_| point(&mut rng)).collect();
@@ -108,11 +109,50 @@ fn run(name: &str, clustered: bool) {
             rec[1] / cnt[1] as f64
         );
     }
+
+    // Exact variant: visit lists by the lower bound |q - c| - radius(c) that
+    // the triangle inequality gives for every member, and stop once that
+    // bound exceeds the current 10th distance. Results equal a full scan.
+    let radius: Vec<f64> = (0..lists)
+        .map(|l| members[l].iter().map(|&i| l2_sq(&data[i * DIM..][..DIM], &cent[l * DIM..][..DIM]).sqrt()).fold(0.0, f64::max))
+        .collect();
+    let (mut rec, mut cnt, mut scanned) = ([0f64; 2], [0usize; 2], [0usize; 2]);
+    for (q, f) in &qs {
+        let keep = |i: &usize| f.is_none_or(|c| cat[*i] == c);
+        let truth = top10((0..n).filter(keep), &data, q);
+        let mut order: Vec<(f64, usize)> =
+            (0..lists).map(|l| (l2_sq(q, &cent[l * DIM..][..DIM]).sqrt() - radius[l], l)).collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut best: Vec<(f64, usize)> = Vec::new();
+        let g = f.is_some() as usize;
+        for &(lb, l) in &order {
+            if best.len() == 10 && lb > best[9].0 {
+                break;
+            }
+            scanned[g] += members[l].len();
+            for &i in members[l].iter().filter(|i| keep(i)) {
+                best.push((l2_sq(&data[i * DIM..][..DIM], q).sqrt(), i));
+            }
+            best.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            best.truncate(10);
+        }
+        rec[g] += best.iter().filter(|(_, i)| truth.contains(i)).count() as f64 / truth.len().max(1) as f64;
+        cnt[g] += 1;
+    }
+    println!(
+        "  exact pruning: scanned {:.1}% (no filter) {:.1}% (filter), recall {:.4} / {:.4}",
+        100.0 * scanned[0] as f64 / (cnt[0] * n) as f64,
+        100.0 * scanned[1] as f64 / (cnt[1] * n) as f64,
+        rec[0] / cnt[0] as f64,
+        rec[1] / cnt[1] as f64
+    );
 }
 
 #[test]
 #[ignore]
 fn ivf_recall_vs_scan() {
-    run("uniform [-1, 1)", false);
-    run("50 gaussian clusters, sigma 0.15", true);
+    run("uniform [-1, 1)", None);
+    for sigma in [0.15, 0.3, 0.5] {
+        run(&format!("50 gaussian clusters, sigma {sigma}"), Some(sigma));
+    }
 }
