@@ -3,7 +3,7 @@
 //! `Unsupported` rather than `Syntax`, so they are never silently reinterpreted.
 
 use super::ast::*;
-use super::lexer::{tokenize, Tok, Token};
+use super::lexer::{skip_space, tokenize, Tok, Token};
 use crate::error::{DbError, DbResult};
 use crate::types::DataType;
 use crate::{bail, db_err};
@@ -27,8 +27,9 @@ fn is_reserved(word: &str) -> bool {
 }
 
 /// True if `sql` holds only whitespace and comments.
+/// True if `sql` holds only whitespace and complete comments.
 pub fn is_blank(sql: &str) -> bool {
-    tokenize(sql).is_ok_and(|t| t.len() == 1)
+    matches!(skip_space(sql, 0), Ok(i) if i == sql.len())
 }
 
 /// Parses one statement; a trailing `;` is allowed.
@@ -668,10 +669,13 @@ impl Parser<'_> {
                 self.advance();
                 Ok(Expr::Lit(lit))
             }
-            Tok::Str(s) => {
-                let lit = Literal::Str(s.clone());
+            Tok::Str(_) => {
+                // Tokens are never revisited, so the string can be moved out.
+                let Tok::Str(s) = std::mem::replace(&mut self.toks[self.pos].tok, Tok::Str(String::new())) else {
+                    unreachable!()
+                };
                 self.advance();
-                Ok(Expr::Lit(lit))
+                Ok(Expr::Lit(Literal::Str(s)))
             }
             Tok::LParen => {
                 self.advance();

@@ -28,6 +28,7 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | AVX2/FMA distance prefilter (exact results), benchmark harness | done, measured |
 | Columnar row cache with filter pushdown | done, differential-tested, measured |
 | Docker image (pinned bases, `tests/docker_smoke.sh`) | builds, smoke-tested, benchmarked |
+| Write path: single-pass vector parsing, no re-lexing | done, unit- and differential-tested, measured |
 | Wire format, error codes, ready marker | waiting for the official test driver |
 | Vector index (ANN), log compaction | next |
 
@@ -88,16 +89,25 @@ time, scalar fallback otherwise), and its exact f64 distance is computed
 only when a proven error bound says it could still place, so results and
 distances are the same as a full exact scan.
 
+On the write side, quoted text is skipped eight bytes at a time when
+statements are split and lexed, string literals move from tokens into the
+syntax tree instead of being copied, and vector literals are parsed in one
+pass. Elements with at most 2^24 as significand and a decimal exponent of at
+most 10 (all of the benchmark's) take Clinger's exact fast path: one float32
+multiply or divide, bit-identical to `str::parse::<f32>`; anything else goes
+through the general parser. What remains of the write phase is mostly the
+100 `fdatasync` calls (about 0.8 ms each here).
+
 Median of five runs on an i5-9400F, NVMe ext4:
 
 | Phase | T | Peak memory | Disk I/O |
 |---|---|---|---|
-| write (100 commits) | 292 ms | 7.6 MiB | 5.45 MiB written |
+| write (100 commits) | 151 ms | 7.3 MiB | 5.45 MiB written |
 | query (1,000 TopK) | 311 ms | 6.8 MiB | 5.06 MiB read |
 
 Inside the container (`--docker`) `io.stat` reports the same bytes as
 `/proc/<pid>/io`, and memory is within 0.3 MiB, but times are higher: write
-377 ms, query 462-552 ms. Each statement's round trip through Docker's stdio
+170 ms (377 ms before the write-path work), query 462-552 ms. Each statement's round trip through Docker's stdio
 relay costs about 90 µs more (the `--floor` run is 136 ms instead of 45 ms),
 which any submission measured this way pays too. The same binary also uses
 more CPU per query there (0.35 s instead of 0.29 s), consistent with a native

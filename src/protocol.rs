@@ -8,6 +8,7 @@ use std::io::{self, Write};
 
 use crate::engine::result::{Cell, ExecResult};
 use crate::error::DbResult;
+use crate::sql::lexer::find2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -191,10 +192,15 @@ impl Splitter {
                     _ => {}
                 },
                 State::Quote(q) => {
-                    if c == b'\\' && q != b'`' {
-                        i += 1;
-                    } else if c == q {
-                        self.state = State::Normal;
+                    // Jump to the closing quote or the next escape.
+                    let esc = if q == b'`' { q } else { b'\\' };
+                    match find2(&b[i..], q, esc) {
+                        Some(off) if b[i + off] == q => {
+                            i += off;
+                            self.state = State::Normal;
+                        }
+                        Some(off) => i += off + 1,
+                        None => i = b.len() - 1,
                     }
                 }
                 State::LineComment => {

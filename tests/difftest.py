@@ -855,6 +855,13 @@ def run_seed(args, seed):
                 after_model = model.clone()
                 after_model.execute(st)
                 after = model_snapshot(after_model.db, names)
+                mid = None
+                if st.kind in ("create", "drop"):
+                    # DDL first commits the open transaction in its own log
+                    # frame, so a crash can keep that commit without the DDL.
+                    mid_model = model.clone()
+                    mid_model.commit()
+                    mid = model_snapshot(mid_model.db, names)
                 db.send(sql)
                 # A commit takes well under a millisecond here, so most kills
                 # must come almost immediately to land before it is durable.
@@ -896,6 +903,9 @@ def run_seed(args, seed):
                     if not same_result(probe, want):
                         return fail(f"step {step}: index probe after crash during `{sql}`\n"
                                     f"  expected: {fmt(want)}\n  got:      {fmt(probe)}")
+                elif mid is not None and same_snapshot(got, mid):
+                    model = mid_model
+                    STATS["crash:ddl-commit-only"] += 1
                 else:
                     return fail(f"step {step}: state after crash during `{sql}` matches neither side\n"
                                 f"  got:    {fmt(got)}\n  before: {fmt(before)}\n  after:  {fmt(after)}")

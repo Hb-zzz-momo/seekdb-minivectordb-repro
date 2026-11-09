@@ -42,23 +42,12 @@ pub fn tokenize(src: &str) -> DbResult<Vec<Token>> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    while i < b.len() {
+    loop {
+        i = skip_space(src, i)?;
+        if i >= b.len() {
+            break;
+        }
         let c = b[i];
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == b'#' || (c == b'-' && b.get(i + 1) == Some(&b'-') && b.get(i + 2).is_none_or(|x| x.is_ascii_whitespace())) {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            let close = src[i + 2..].find("*/").ok_or_else(|| db_err!(Syntax, "unterminated comment"))?;
-            i += 2 + close + 2;
-            continue;
-        }
         let start = i;
         let next = b.get(i + 1).copied();
         let tok = match c {
@@ -118,6 +107,47 @@ pub fn tokenize(src: &str) -> DbResult<Vec<Token>> {
     Ok(out)
 }
 
+/// Skips whitespace and comments from `i`; returns where the next token
+/// starts, or `src.len()`.
+pub fn skip_space(src: &str, mut i: usize) -> DbResult<usize> {
+    let b = src.as_bytes();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'#' || (c == b'-' && b.get(i + 1) == Some(&b'-') && b.get(i + 2).is_none_or(|x| x.is_ascii_whitespace())) {
+            i = find2(&b[i..], b'\n', b'\n').map_or(b.len(), |p| i + p);
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let close = src[i + 2..].find("*/").ok_or_else(|| db_err!(Syntax, "unterminated comment"))?;
+            i += 2 + close + 2;
+        } else {
+            break;
+        }
+    }
+    Ok(i)
+}
+
+/// Index of the first byte equal to `x` or `y`, eight bytes at a time.
+pub fn find2(hay: &[u8], x: u8, y: u8) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let (vx, vy) = (LO * x as u64, LO * y as u64);
+    let (words, _) = hay.as_chunks::<8>();
+    for (n, w) in words.iter().enumerate() {
+        let w = u64::from_le_bytes(*w);
+        let (a, b) = (w ^ vx, w ^ vy);
+        // Flags the zero bytes of a and b, i.e. the matches. A borrow can also
+        // flag a byte above a true match, never below one, so the lowest flag
+        // is the first match.
+        let m = ((a.wrapping_sub(LO) & !a) | (b.wrapping_sub(LO) & !b)) & HI;
+        if m != 0 {
+            return Some(n * 8 + (m.trailing_zeros() / 8) as usize);
+        }
+    }
+    let done = words.len() * 8;
+    hay[done..].iter().position(|&c| c == x || c == y).map(|p| done + p)
+}
+
 fn single(i: &mut usize, t: Tok) -> Tok {
     *i += 1;
     t
@@ -161,8 +191,15 @@ fn lex_number(b: &[u8], mut i: usize) -> usize {
 /// MySQL-style string: doubled quote or backslash escapes.
 fn lex_string(src: &str, start: usize, quote: u8) -> DbResult<(String, usize)> {
     let b = src.as_bytes();
-    let mut buf = Vec::new();
     let mut i = start + 1;
+    // Common case: no escape before the closing quote.
+    if let Some(off) = find2(&b[i..], quote, b'\\') {
+        let j = i + off;
+        if b[j] == quote && b.get(j + 1) != Some(&quote) {
+            return Ok((src[i..j].to_string(), j + 1));
+        }
+    }
+    let mut buf = Vec::new();
     loop {
         let Some(&c) = b.get(i) else {
             bail!(Syntax, "unterminated string literal");
@@ -274,6 +311,28 @@ mod tests {
         );
         assert_eq!(toks("1--2"), vec![Tok::Number("1".into()), Tok::Minus, Tok::Minus, Tok::Number("2".into()), Tok::Eof]);
         assert_eq!(toks("'旅行攻略'"), vec![Tok::Str("旅行攻略".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn find2_matches_naive_search() {
+        let mut hay: Vec<u8> = (0..200u32).map(|i| (i * 37 % 251) as u8).collect();
+        hay.extend_from_slice(b"\x00\x01\x80\xff'\\");
+        for x in [0u8, 1, 0x7f, 0x80, 0xff, b'\'', b'\\', 200] {
+            for y in [x, 0, 0xff, b'\\'] {
+                for start in 0..hay.len() {
+                    let h = &hay[start..];
+                    assert_eq!(find2(h, x, y), h.iter().position(|&c| c == x || c == y), "{x} {y} {start}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn skip_space_and_blank_input() {
+        assert_eq!(skip_space("  -- x\n# y\n/* z */ a", 0).unwrap(), 19);
+        assert_eq!(skip_space("--", 0).unwrap(), 2);
+        assert_eq!(skip_space("--x", 0).unwrap(), 0);
+        assert!(skip_space(" /* open", 0).is_err());
     }
 
     #[test]
