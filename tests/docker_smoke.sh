@@ -47,7 +47,7 @@ expect_line "$out" '{"ready":true}'
 expect_line "$out" '{"ok":true,"affected":3}'
 expect_line "$out" '{"columns":["id"],"rows":[[3]]}'
 expect_line "$out" '{"columns":["id"],"rows":[[1],[2],[3]]}'
-grep -q '"error":"NoSuchColumn"' <<<"$out" || fail "no NoSuchColumn error in: $out"
+grep -q '"error":"column_not_found"' <<<"$out" || fail "no column_not_found error in: $out"
 [ "$(grep -vc '^{' <<<"$out")" = 0 ] || fail "non-JSON line on stdout: $out"
 
 echo "2. data survives a restart"

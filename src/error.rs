@@ -1,7 +1,6 @@
 use std::fmt;
 
-/// Error categories. The protocol layer maps these to the official error
-/// codes once the problem package defines them.
+/// Error categories, reported to clients by `name`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     Syntax,
@@ -26,6 +25,34 @@ pub enum ErrorKind {
     Internal,
 }
 
+impl ErrorKind {
+    /// Semantic error name, in the style of the public cases' `error`
+    /// assertions (`duplicate_key`, `unsupported_sql`, `dimension_mismatch`;
+    /// the other names are ours until the official mapping is frozen).
+    pub fn name(self) -> &'static str {
+        match self {
+            ErrorKind::Syntax => "syntax_error",
+            ErrorKind::Unsupported => "unsupported_sql",
+            ErrorKind::TableExists => "table_exists",
+            ErrorKind::NoSuchTable => "table_not_found",
+            ErrorKind::NoSuchColumn => "column_not_found",
+            ErrorKind::DuplicateKey => "duplicate_key",
+            ErrorKind::ColumnCount => "column_count_mismatch",
+            ErrorKind::NoDefault => "missing_value",
+            ErrorKind::TypeMismatch => "type_mismatch",
+            ErrorKind::OutOfRange => "out_of_range",
+            ErrorKind::DataTooLong => "data_too_long",
+            ErrorKind::VectorDim => "dimension_mismatch",
+            ErrorKind::InvalidValue => "invalid_value",
+            ErrorKind::Schema => "invalid_schema",
+            ErrorKind::TxnState => "transaction_state",
+            ErrorKind::Io => "io_error",
+            ErrorKind::Corrupt => "corrupt_data",
+            ErrorKind::Internal => "internal_error",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DbError {
     pub kind: ErrorKind,
@@ -40,7 +67,7 @@ impl DbError {
 
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.msg)
+        write!(f, "{}: {}", self.kind.name(), self.msg)
     }
 }
 

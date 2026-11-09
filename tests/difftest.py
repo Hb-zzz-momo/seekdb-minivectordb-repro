@@ -708,6 +708,18 @@ class Crashed(Exception):
     pass
 
 
+# The database reports semantic error names (ErrorKind::name); the model
+# uses the kind names.
+ERROR_KINDS = {
+    "syntax_error": "Syntax", "unsupported_sql": "Unsupported", "table_exists": "TableExists",
+    "table_not_found": "NoSuchTable", "column_not_found": "NoSuchColumn", "duplicate_key": "DuplicateKey",
+    "column_count_mismatch": "ColumnCount", "missing_value": "NoDefault", "type_mismatch": "TypeMismatch",
+    "out_of_range": "OutOfRange", "data_too_long": "DataTooLong", "dimension_mismatch": "VectorDim",
+    "invalid_value": "InvalidValue", "invalid_schema": "Schema", "transaction_state": "TxnState",
+    "io_error": "Io", "corrupt_data": "Corrupt", "internal_error": "Internal",
+}
+
+
 class Db:
     def __init__(self, binary, data_dir, log_path, timeout, wait_ready=True):
         self.timeout = timeout
@@ -740,7 +752,10 @@ class Db:
 
     def query(self, sql):
         self.send(sql)
-        return json.loads(self._readline())
+        r = json.loads(self._readline())
+        if "error" in r:
+            r["error"] = ERROR_KINDS.get(r["error"], r["error"])
+        return r
 
     def kill(self):
         self.p.kill()

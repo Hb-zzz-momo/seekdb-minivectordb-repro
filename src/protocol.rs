@@ -14,7 +14,7 @@ use crate::sql::lexer::find2;
 pub enum Format {
     Text,
     /// One JSON object per statement: `{"ok":true,"affected":n}`,
-    /// `{"columns":[..],"rows":[[..]]}` or `{"error":"Kind","message":".."}`.
+    /// `{"columns":[..],"rows":[[..]]}` or `{"error":"name","message":".."}`.
     Jsonl,
 }
 
@@ -65,7 +65,7 @@ fn write_text(out: &mut impl Write, res: &DbResult<ExecResult>) -> io::Result<()
             }
             Ok(())
         }
-        Err(e) => writeln!(out, "ERROR {:?}: {}", e.kind, e.msg),
+        Err(e) => writeln!(out, "ERROR {}: {}", e.kind.name(), e.msg),
     }
 }
 
@@ -98,7 +98,7 @@ fn write_jsonl(out: &mut impl Write, res: &DbResult<ExecResult>) -> io::Result<(
             s.push_str("]}");
         }
         Err(e) => {
-            s.push_str(&format!("{{\"error\":\"{:?}\",\"message\":", e.kind));
+            s.push_str(&format!("{{\"error\":\"{}\",\"message\":", e.kind.name()));
             push_json_str(&mut s, &e.msg);
             s.push('}');
         }
