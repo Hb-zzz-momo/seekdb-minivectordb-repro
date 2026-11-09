@@ -30,9 +30,11 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Docker image (pinned bases, `tests/docker_smoke.sh`) | builds, smoke-tested, benchmarked |
 | Write path: single-pass vector parsing, no re-lexing | done, unit- and differential-tested, measured |
 | Row cache built on first read; dictionary codes for `=`/`<>` on strings | done, unit-, differential- and crash-tested, measured |
-| Wire format, error codes, ready marker | waiting for the official test driver |
+| One statement per input line; semantic error names (`duplicate_key`, ...) | done, as the public cases define them |
+| Result rows streamed to stdout (bounded memory for any result size) | done, unit-, differential- and memory-tested |
+| Wire format, ready marker, ANN mode switch | waiting for the official test driver |
 | Exact vector index (k-means lists and 8-bit codes, triangle-inequality bounds) | done, unit-, differential- and crash-tested, measured |
-| Organizers' public sample cases (`mysqltest/`) | 5/5 pass (`tests/public_cases.py`) |
+| Organizers' public sample cases (`mysqltest/`, v4) | 20/20 pass (`tests/public_cases.py`) |
 | Approximate (ANN) mode, log compaction | next |
 
 ## Testing
@@ -43,13 +45,18 @@ cargo build --release
 python3 tests/difftest.py --seeds 0:100 --steps 400            # results vs reference model
 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash    # plus kill -9 and recovery
 MVDB_IVF_MIN_ROWS=1 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash   # vector index on every table
+MVDB_IVF_MIN_ROWS=1 MVDB_IVF_MAX_ROWS=30 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash   # tables crossing the list cap
 python3 tests/public_cases.py                                   # the organizers' sample cases in mysqltest/
 ```
 
 `tests/public_cases.py` runs each case listed in `mysqltest/manifest.json`
 on a fresh data directory and checks every result against its `.result`
 assertions as `mysqltest/README.md` describes them (exact integers, strings
-and column names; floats within 1e-5; `unordered` as a multiset).
+and column names; floats within 1e-5; `unordered` as a multiset; `error` by
+its semantic name). A `--restart` line closes stdin, waits for the exit and
+starts again on the same directory; `--mode ann` is only noted, since how the
+official driver switches modes is not published and exact answers are valid
+approximate ones.
 
 `tests/difftest.py` generates random sessions (DDL, multi-row INSERT with
 duplicate keys and invalid values, UPDATE, DELETE, filtered SELECT, TopK,
@@ -100,8 +107,9 @@ time, scalar fallback otherwise), and its exact f64 distance is computed
 only when a proven error bound says it could still place, so results and
 distances are the same as a full exact scan.
 
-On the write side, quoted text is skipped eight bytes at a time when
-statements are split and lexed, string literals move from tokens into the
+On the write side, each input line is one statement (as in the public
+cases), so nothing scans for `;` across lines; quoted text is skipped eight
+bytes at a time when statements are lexed, string literals move from tokens into the
 syntax tree instead of being copied, and vector literals are parsed in one
 pass. Elements with at most 2^24 as significand and a decimal exponent of at
 most 10 (all of the benchmark's) take Clinger's exact fast path: one float32
@@ -136,7 +144,8 @@ using 0.5 MiB, so the write phase measures 4.6-4.7 MiB in the container
 0.3 MiB of native.
 
 Tables of 4,096 rows or more also get an exact vector index with two
-parts, both exact by the triangle inequality:
+parts, both exact by the triangle inequality (lists only up to 50,000 rows,
+see below):
 
 - **k-means lists.** Rows are grouped into about √n lists around k-means
   centroids, and each list keeps an upper bound on its members' distance to
@@ -165,6 +174,16 @@ adds about 60 ms (lists) and 10 ms (codes) to recovery. A filtered TopK
 skips the lists while they have recently had to visit more than half the
 table, and selects the matching rows directly instead.
 
+Assigning every row to the nearest of about √n centroids makes the lists'
+build O(n^1.5), so tables of more than 50,000 rows (`MVDB_IVF_MAX_ROWS`) get
+the codes only, and a rebuild past that size drops lists built earlier.
+With 128-d uniform rows, recovery of a cached table then takes 181 ms at
+100,000 rows and 338 ms at 200,000 (1,112 and 2,259 ms with lists), 843 ms
+at 500,000; at 50,000 rows, still with lists, about 475 ms. The price is on
+clustered data: at 100,000 rows in 50 clusters of σ = 0.15 a TopK takes
+0.92 ms with the codes alone against 0.10 ms with lists (at σ = 0.5 both
+about 1 ms).
+
 `=` and `<>` against a constant on a string column compare 4-byte
 dictionary codes rather than strings while the column has at most 1,024
 distinct values.
@@ -181,15 +200,21 @@ off the lists, `MVDB_SQ8=0` the codes):
 
 Peak memory is 6.7-6.8 MiB without the codes and 7.7-7.9 MiB with them.
 The lists only prune when clusters are tight relative to the distances
-between them; the codes help on any data. About 45 ms of each figure is
-the benchmark's own round trips (`--floor`).
+between them: a list is passed over only if `|q - c|` exceeds its radius
+plus the K-th distance, and at σ = 0.5 the radius (about 6.7) plus the 10th
+distance (7.2) is more than the distance to the nearest other centroid (9.8).
+The codes helped on all four shapes, but not on every distribution: on
+near-duplicate rows (one vector plus noise), where almost every row is
+within the codes' error of the K-th distance, they prune nothing and cost
+about 30% (5.5 against 4.2 ms per TopK at 100,000 rows). About 45 ms of each
+figure is the benchmark's own round trips (`--floor`).
 
 Environment variables for experiments only: `MVDB_CACHE_BYTES` (row cache
 budget; default a quarter of the cgroup memory limit),
 `MVDB_DROP_CACHE=0` (keep log pages in the page cache), `MVDB_IVF=0` and
-`MVDB_SQ8=0` (leave out the lists or the codes) and `MVDB_IVF_MIN_ROWS`
+`MVDB_SQ8=0` (leave out the lists or the codes), `MVDB_IVF_MIN_ROWS`
 (table size from which the index is used; the differential tests set it
-to 1).
+to 1) and `MVDB_IVF_MAX_ROWS` (largest table that gets lists).
 
 ## Semantics chosen where the task text is silent
 
@@ -227,4 +252,24 @@ one vector column), `DROP TABLE`, `CREATE VECTOR INDEX`, multi-row `INSERT`,
 `SELECT` with `=`/`<>`/`<`/`<=`/`>`/`>=`/`AND`, `ORDER BY`, `LIMIT`,
 `L2_DISTANCE`, `UPDATE`, `DELETE`, `BEGIN`/`COMMIT`/`ROLLBACK`. Other SQL
 (OR, NOT, NULL, JOIN, aggregates, subqueries, ALTER, ...) returns an
-`Unsupported` error and is never executed with a different meaning.
+`unsupported_sql` error and is never executed with a different meaning.
+Expressions nest at most 128 levels (parentheses, function arguments);
+deeper input is a `syntax_error`, while AND chains of any length are kept
+as one flat list.
+
+## Protocol
+
+Each non-empty input line is one complete statement; a trailing `;` is
+optional, an unclosed quote or comment is that line's syntax error, and a
+line holding only a comment gets no response. `quit` or `exit` (or end of
+input) ends the session; an open transaction is rolled back. Errors carry a
+semantic name (`duplicate_key`, `unsupported_sql`, `dimension_mismatch` as
+in the public cases; the rest, such as `table_not_found` or
+`invalid_value`, are ours until the official mapping is published). Result
+rows are written while they are produced: a response is held back until it
+passes 64 KiB, then streamed, so `SELECT *` over a table larger than memory
+adds no measurable memory (100,000 x 128 rows in a 64 MiB container).
+ORDER BY on anything but the primary key still keeps every matching row's
+sort key (about 10-25 MiB at 100,000 rows), and TopK its K ids.
+`MVDB_FORMAT=jsonl` prints one JSON object per statement; the default text
+format is a placeholder until the official driver is published.
