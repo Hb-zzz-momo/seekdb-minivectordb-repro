@@ -93,6 +93,98 @@ unsafe fn l2_sq_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Exact squared distance between two code vectors: `q` holds codes widened
+/// to i16, `x` the row's codes. Every code is in [-127, 127].
+#[inline]
+pub fn ssd_i8(q: &[i16], x: &[i8]) -> u64 {
+    debug_assert_eq!(q.len(), x.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU supports AVX2, checked just above.
+        return unsafe { ssd_i8_avx2(q, x) };
+    }
+    ssd_i8_scalar(q, x)
+}
+
+pub(crate) fn ssd_i8_scalar(q: &[i16], x: &[i8]) -> u64 {
+    q.iter().zip(x).map(|(&a, &b)| (i32::from(a) - i32::from(b)).pow(2) as u64).sum()
+}
+
+/// Sixteen codes per step: widen to i16, subtract, then `madd` squares and
+/// adds pairs into i32 lanes. Longer vectors than `SHORT_CODES` flush their
+/// lanes to u64 every 4096 steps, long before a lane could overflow.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn ssd_i8_avx2(q: &[i16], x: &[i8]) -> u64 {
+    let n = q.len().min(x.len());
+    if n < SHORT_CODES {
+        return ssd_i8_short_avx2(q, x);
+    }
+    let (pq, px) = (q.as_ptr(), x.as_ptr());
+    let mut total = 0u64;
+    let mut i = 0;
+    while i + 16 <= n {
+        let end = n.min(i + 16 * 4096);
+        let mut acc = [_mm256_setzero_si256(); 2];
+        let mut j = 0;
+        while i + 16 <= end {
+            let xv = _mm256_cvtepi8_epi16(_mm_loadu_si128(px.add(i) as *const __m128i));
+            let d = _mm256_sub_epi16(_mm256_loadu_si256(pq.add(i) as *const __m256i), xv);
+            acc[j] = _mm256_add_epi32(acc[j], _mm256_madd_epi16(d, d));
+            j ^= 1;
+            i += 16;
+        }
+        let mut lanes = [0i32; 16];
+        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc[0]);
+        _mm256_storeu_si256(lanes.as_mut_ptr().add(8) as *mut __m256i, acc[1]);
+        total += lanes.iter().map(|&l| l as u64).sum::<u64>();
+    }
+    total + ssd_i8_scalar(&q[i..n], &x[i..n])
+}
+
+/// Vectors shorter than this have a code distance below 2^31 (at most
+/// 254^2 per component), so it is summed in i32 lanes and reduced in
+/// registers.
+pub(crate) const SHORT_CODES: usize = 32768;
+
+/// `ssd_i8_avx2` for fewer than `SHORT_CODES` codes, small enough to be
+/// inlined into scan loops.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(crate) unsafe fn ssd_i8_short_avx2(q: &[i16], x: &[i8]) -> u64 {
+    let n = q.len().min(x.len());
+    debug_assert!(n < SHORT_CODES);
+    let (pq, px) = (q.as_ptr(), x.as_ptr());
+    let mut acc = [_mm256_setzero_si256(); 2];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (j, a) in acc.iter_mut().enumerate() {
+            let xv = _mm256_cvtepi8_epi16(_mm_loadu_si128(px.add(i + 16 * j) as *const __m128i));
+            let d = _mm256_sub_epi16(_mm256_loadu_si256(pq.add(i + 16 * j) as *const __m256i), xv);
+            *a = _mm256_add_epi32(*a, _mm256_madd_epi16(d, d));
+        }
+        i += 32;
+    }
+    if i + 16 <= n {
+        let xv = _mm256_cvtepi8_epi16(_mm_loadu_si128(px.add(i) as *const __m128i));
+        let d = _mm256_sub_epi16(_mm256_loadu_si256(pq.add(i) as *const __m256i), xv);
+        acc[0] = _mm256_add_epi32(acc[0], _mm256_madd_epi16(d, d));
+        i += 16;
+    }
+    let s = _mm256_add_epi32(acc[0], acc[1]);
+    let s = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256::<1>(s));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s));
+    let mut total = _mm_cvtsi128_si32(s) as u32 as u64;
+    while i < n {
+        let d = i32::from(*pq.add(i)) - i32::from(*px.add(i));
+        total += (d * d) as u64;
+        i += 1;
+    }
+    total
+}
+
 /// Error bound of `l2_sq_f32` for one vector length: whenever its result is
 /// finite, `l2_sq_f32(a, b) <= (1 + rel) * exact + abs`, where `exact` is the
 /// squared distance in real arithmetic.
@@ -203,6 +295,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn code_kernel_is_exact() {
+        let mut rng = Rng(42);
+        for len in [0usize, 1, 15, 16, 17, 31, 32, 33, 128, 129, 1000, 70_000] {
+            for _ in 0..5 {
+                let q: Vec<i16> = (0..len).map(|_| (rng.next() % 255) as i16 - 127).collect();
+                let x: Vec<i8> = (0..len).map(|_| ((rng.next() % 255) as i16 - 127) as i8).collect();
+                let want: u64 = q.iter().zip(&x).map(|(&a, &b)| ((a as i64 - b as i64) * (a as i64 - b as i64)) as u64).sum();
+                assert_eq!(ssd_i8(&q, &x), want, "len {len}");
+                assert_eq!(ssd_i8_scalar(&q, &x), want, "len {len}");
+            }
+        }
+        // Largest differences everywhere: lanes must not overflow.
+        let (q, x) = (vec![127i16; 200_000], vec![-127i8; 200_000]);
+        assert_eq!(ssd_i8(&q, &x), 200_000 * 254 * 254);
     }
 
     #[test]

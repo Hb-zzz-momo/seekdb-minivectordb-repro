@@ -31,7 +31,7 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Write path: single-pass vector parsing, no re-lexing | done, unit- and differential-tested, measured |
 | Row cache built on first read; dictionary codes for `=`/`<>` on strings | done, unit-, differential- and crash-tested, measured |
 | Wire format, error codes, ready marker | waiting for the official test driver |
-| Exact vector index (k-means lists, triangle-inequality pruning) | done, unit-, differential- and crash-tested, measured |
+| Exact vector index (k-means lists and 8-bit codes, triangle-inequality bounds) | done, unit-, differential- and crash-tested, measured |
 | Organizers' public sample cases (`mysqltest/`) | 5/5 pass (`tests/public_cases.py`) |
 | Approximate (ANN) mode, log compaction | next |
 
@@ -120,52 +120,76 @@ Median of five runs on an i5-9400F, NVMe ext4:
 | Phase | T | Peak memory | Disk I/O |
 |---|---|---|---|
 | write (100 commits) | 149 ms | 2.1 MiB | 5.45 MiB written |
-| query (1,000 TopK) | 311 ms | 6.8 MiB | 5.06 MiB read |
+| query (1,000 TopK, uniform data) | 132 ms | 7.9 MiB | 5.06 MiB read |
 
 Inside the container (`--docker`) `io.stat` reports the same bytes as
-`/proc/<pid>/io`, and memory is within 0.3 MiB, but times are higher: write
-170 ms (377 ms before the write-path work), query 462-552 ms. Each statement's round trip through Docker's stdio
-relay costs about 90 µs more (the `--floor` run is 136 ms instead of 45 ms),
-which any submission measured this way pays too. The same binary also uses
-more CPU per query there (0.35 s instead of 0.29 s), consistent with a native
+`/proc/<pid>/io`, but times are higher: write about 179 ms, query 240-247 ms
+(462-552 ms before the vector codes). Each statement's round trip through
+Docker's stdio relay costs about 90 µs more (the `--floor` run is 136 ms
+instead of 45 ms), which any submission measured this way pays too. The
+same binary also uses more CPU per query there, consistent with a native
 probe in which idle gaps between statements raise the cost of each query.
+Memory there has a floor of its own: an idle container that has only
+printed its ready line already shows a `memory.peak` of about 5 MiB while
+using 0.5 MiB, so the write phase measures 4.6-4.7 MiB in the container
+(7.6 MiB before its row cache was deferred) and query memory is within
+0.3 MiB of native.
 
-Tables of 4,096 rows or more also get an exact vector index. Rows are
-grouped into about √n lists around k-means centroids, and each list keeps
-an upper bound on its members' distance to the centroid. By the triangle
-inequality no member of a list is closer to the query than
-`|q - c| - radius`, so a TopK visits lists in that order and stops at the
-first one whose bound exceeds the K-th distance found so far; results,
-ties included, are the same as a full scan. The bound uses the float32
-kernel's proven error bound plus a padding far above f64 rounding. When the
-index is built (during recovery, on `CREATE VECTOR INDEX`, or before a TopK
-once the table is big enough or has doubled), the cached rows are moved so
-each list is contiguous, which keeps a scan that has to visit every list as
-fast as the plain one. It is never built during the write phase; building
-it adds about 60 ms to recovery for 10,000 rows.
+Tables of 4,096 rows or more also get an exact vector index with two
+parts, both exact by the triangle inequality:
 
-Query phase, median of five, recall 1.0 in every case, peak memory
-unchanged (6.6-6.8 MiB):
+- **k-means lists.** Rows are grouped into about √n lists around k-means
+  centroids, and each list keeps an upper bound on its members' distance to
+  the centroid. No member of a list is closer to the query than
+  `|q - c| - radius`, so a TopK visits lists in that order and stops at the
+  first one whose bound exceeds the K-th distance found so far. When the
+  lists are built the cached rows are moved so each list is contiguous,
+  which keeps a scan that has to visit every list as fast as the plain one.
+- **8-bit codes.** Every component is also stored as
+  `c = round(x / step)` in [-127, 127] (one step per column), and every row
+  keeps an upper bound on `|x - step * c|`. With the query coded the same
+  way, `|q - x| >= step * |cq - cx| - |q - step * cq| - |x - step * cx|`,
+  where `|cq - cx|` is computed exactly in integers by an AVX2 kernel. A
+  row whose bound exceeds the K-th distance is passed over without reading
+  its floats, so most rows cost one byte per component instead of four;
+  on uniform data only about 15 rows per query out of 10,000 are left to
+  measure in float32.
 
-| Data (10,000 x 128) | Without index | With index |
-|---|---|---|
-| uniform in [-1, 1) | 305 ms | 315 ms |
-| 50 clusters, σ = 0.15 | 310 ms | 50 ms |
-| 50 clusters, σ = 0.3 | 289 ms | 51 ms |
-| 50 clusters, σ = 0.5 | 287 ms | 305 ms |
-
-The bounds only prune when clusters are tight relative to the distances
-between them; on uniform data or wide clusters the index visits every row.
+Results, ties included, are the same as a full scan: every bound carries a
+padding far above f64 rounding (and the float32 kernel's proven error bound
+where it uses float32 distances), and a row is skipped only when its bound
+is strictly greater than the K-th distance. The index is built during
+recovery, on `CREATE VECTOR INDEX`, or before a TopK once the table is big
+enough or has doubled, never during the write phase; for 10,000 rows it
+adds about 60 ms (lists) and 10 ms (codes) to recovery. A filtered TopK
+skips the lists while they have recently had to visit more than half the
+table, and selects the matching rows directly instead.
 
 `=` and `<>` against a constant on a string column compare 4-byte
 dictionary codes rather than strings while the column has at most 1,024
 distinct values.
 
+Query phase, median of five, recall 1.0 in every run (`MVDB_IVF=0` turns
+off the lists, `MVDB_SQ8=0` the codes):
+
+| Data (10,000 x 128) | Neither | Lists | Codes | Both (default) |
+|---|---|---|---|---|
+| uniform in [-1, 1) | 301 ms | 301 ms | 135 ms | 133 ms |
+| 50 clusters, σ = 0.15 | 298 ms | 51 ms | 139 ms | 51 ms |
+| 50 clusters, σ = 0.3 | 287 ms | 52 ms | 136 ms | 52 ms |
+| 50 clusters, σ = 0.5 | 284 ms | 281 ms | 134 ms | 128 ms |
+
+Peak memory is 6.7-6.8 MiB without the codes and 7.7-7.9 MiB with them.
+The lists only prune when clusters are tight relative to the distances
+between them; the codes help on any data. About 45 ms of each figure is
+the benchmark's own round trips (`--floor`).
+
 Environment variables for experiments only: `MVDB_CACHE_BYTES` (row cache
-budget; default a quarter of the cgroup memory limit) and
-`MVDB_DROP_CACHE=0` (keep log pages in the page cache), `MVDB_IVF=0` (no
-vector index) and `MVDB_IVF_MIN_ROWS` (table size from which the index is
-used; the differential tests set it to 1).
+budget; default a quarter of the cgroup memory limit),
+`MVDB_DROP_CACHE=0` (keep log pages in the page cache), `MVDB_IVF=0` and
+`MVDB_SQ8=0` (leave out the lists or the codes) and `MVDB_IVF_MIN_ROWS`
+(table size from which the index is used; the differential tests set it
+to 1).
 
 ## Semantics chosen where the task text is silent
 

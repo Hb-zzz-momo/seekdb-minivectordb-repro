@@ -25,8 +25,6 @@ pub struct Ivf {
     lists: Vec<Vec<u32>>,
     /// List of each slot, NONE when the slot is not indexed.
     list_of: Vec<u32>,
-    /// Rows indexed when the lists were built.
-    pub built_rows: usize,
 }
 
 impl Ivf {
@@ -65,7 +63,6 @@ impl Ivf {
             radius: vec![0.0; nlist],
             lists: vec![Vec::new(); nlist],
             list_of: vec![NONE; live.len()],
-            built_rows: n,
         };
         for &s in &slots {
             ivf.insert(s, row(s));

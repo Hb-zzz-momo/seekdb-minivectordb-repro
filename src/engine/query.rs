@@ -299,7 +299,7 @@ pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select) -
     if let ([(CExpr::Dist { col, query }, false)], Some(limit)) = (order.as_slice(), limit) {
         let mut top = TopK::new(query, offset.saturating_add(limit));
         let whole = *range.start() == i64::MIN && *range.end() == i64::MAX;
-        if whole && table.has_index() {
+        if whole && table.is_cached() {
             // Uncommitted rows first: they are few and fill the heap early.
             for (&pk, change) in changes.into_iter().flatten() {
                 if let Some(values) = change {
@@ -312,7 +312,7 @@ pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select) -
                 }
             }
             let overlaid = |pk: i64| changes.is_some_and(|c| c.contains_key(&pk));
-            table.topk_indexed(&preds, overlaid, passes_rest, &mut top)?;
+            table.topk(&preds, overlaid, passes_rest, &mut top)?;
         } else {
             scan_visible_unordered(table, log, changes, range, &preds, |row| {
                 if passes_rest(&row) {

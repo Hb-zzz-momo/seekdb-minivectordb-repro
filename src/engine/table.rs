@@ -4,11 +4,14 @@
 //! slot, so a scan walks memory in order and a filter reads only its own
 //! column.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeInclusive;
 
 use super::expr::{holds, ColPred, PredValue};
 use super::ivf::Ivf;
+use super::sq8::Sq8;
+use super::IndexOptions;
 use super::topk::TopK;
 use crate::error::DbResult;
 use crate::sql::ast::CmpOp;
@@ -456,15 +459,43 @@ pub struct Table {
     /// The table's vector column, if it has one.
     vector_col: Option<usize>,
     /// Index over the cached vector column, built on first need (see
-    /// `prepare_index`) and then kept in step with every committed change.
+    /// `prepare_index`) and then kept in step with every committed change:
+    /// k-means lists, and 8-bit codes of every vector.
     index: Option<Ivf>,
+    codes: Option<Sq8>,
+    /// Rows when the index was last built (0: not built).
+    indexed_rows: usize,
+    /// How much of the table filtered TopK scans through the lists visit.
+    filtered_lists: Cell<ListUse>,
+}
+
+/// Average fraction of rows a filtered TopK through the lists visited, and
+/// the number of filtered TopK queries so far. When the lists stop pruning
+/// (wide clusters, uniform data), selecting the matching rows directly is
+/// cheaper, so filtered queries skip the lists except every 16th one, which
+/// keeps the average current.
+#[derive(Clone, Copy, Default)]
+struct ListUse {
+    visited: f32,
+    queries: u32,
+}
+
+/// Slots handed to the codes at a time.
+const BLOCK: usize = 64;
+
+/// Candidate slots for `Table::topk`: neighbouring slots, a selection
+/// spread over the table, or the live slots of a range.
+enum Cand<'a> {
+    Run(&'a [u32]),
+    Scattered(&'a [u32]),
+    Live(std::ops::Range<usize>),
 }
 
 impl Table {
     pub fn new(def: TableDef) -> Table {
         let cache = Some(RowCache::new(&def));
         let vector_col = def.columns.iter().position(|c| matches!(c.ty, DataType::Vector(_)));
-        Table { def, rows: BTreeMap::new(), cache, deferred: false, read: false, vector_col, index: None }
+        Table { def, rows: BTreeMap::new(), cache, deferred: false, read: false, vector_col, index: None, codes: None, indexed_rows: 0, filtered_lists: Cell::default() }
     }
 
     pub fn is_cached(&self) -> bool {
@@ -472,13 +503,17 @@ impl Table {
     }
 
     pub fn cache_bytes(&self) -> usize {
-        self.cache.as_ref().map_or(0, RowCache::bytes) + self.index.as_ref().map_or(0, Ivf::bytes)
+        self.cache.as_ref().map_or(0, RowCache::bytes)
+            + self.index.as_ref().map_or(0, Ivf::bytes)
+            + self.codes.as_ref().map_or(0, Sq8::bytes)
     }
 
     /// Switches the table to reading rows from the log.
     pub fn drop_cache(&mut self) {
         self.cache = None;
         self.index = None;
+        self.codes = None;
+        self.indexed_rows = 0;
         for e in self.rows.values_mut() {
             e.slot = NO_SLOT;
         }
@@ -543,9 +578,14 @@ impl Table {
                     }
                 }
                 let slot = cache.insert(pk, row);
-                if let (Some(ix), Some(col)) = (index, self.vector_col) {
+                if let (Some(col), true) = (self.vector_col, index.is_some() || self.codes.is_some()) {
                     if let ValRef::Vector(v) = cache.get(slot as usize, col) {
-                        ix.insert(slot, v);
+                        if let Some(ix) = index {
+                            ix.insert(slot, v);
+                        }
+                        if let Some(codes) = &mut self.codes {
+                            codes.set(slot, v);
+                        }
                     }
                 }
                 slot
@@ -604,70 +644,152 @@ impl Table {
         Ok(())
     }
 
-    /// Builds the vector index for `topk_indexed` if the table has none or
-    /// has more than doubled since it was built, as long as the table is
-    /// cached, has a vector column and at least `min_rows` rows. The cached
-    /// rows are then laid out list by list, so a TopK scan through the index
-    /// reads memory in order even when it has to visit every list.
-    pub fn prepare_index(&mut self, min_rows: usize) {
+    /// Builds the vector index for `topk` if the table has none or has more
+    /// than doubled since it was built, as long as the table is cached, has a
+    /// vector column and at least `opts.min_rows` rows. With k-means lists
+    /// the cached rows are then laid out list by list, so a TopK scan through
+    /// the lists reads memory in order even when it has to visit every list.
+    pub fn prepare_index(&mut self, opts: IndexOptions) {
         let (Some(cache), Some(col)) = (&mut self.cache, self.vector_col) else {
             return;
         };
         let n = self.rows.len();
-        if n == 0 || n < min_rows || self.index.as_ref().is_some_and(|ix| n <= 2 * ix.built_rows) {
+        if n == 0 || n < opts.min_rows || (self.indexed_rows > 0 && n <= 2 * self.indexed_rows) {
             return;
         }
-        let Some((dim, data)) = cache.vectors(col) else {
-            return;
-        };
-        let mut ix = Ivf::build(dim, data, &cache.live);
-        let order = ix.slot_order(cache.live.len());
-        cache.permute(&order);
-        let mut new_slot = vec![NO_SLOT; order.len()];
-        for (new, &old) in order.iter().enumerate() {
-            new_slot[old as usize] = new as u32;
+        self.indexed_rows = n;
+        if opts.lists {
+            let Some((dim, data)) = cache.vectors(col) else {
+                return;
+            };
+            let mut ix = Ivf::build(dim, data, &cache.live);
+            let order = ix.slot_order(cache.live.len());
+            cache.permute(&order);
+            let mut new_slot = vec![NO_SLOT; order.len()];
+            for (new, &old) in order.iter().enumerate() {
+                new_slot[old as usize] = new as u32;
+            }
+            for e in self.rows.values_mut() {
+                e.slot = new_slot[e.slot as usize];
+            }
+            ix.remap(&new_slot);
+            self.index = Some(ix);
         }
-        for e in self.rows.values_mut() {
-            e.slot = new_slot[e.slot as usize];
+        if opts.codes {
+            if let Some((dim, data)) = cache.vectors(col) {
+                self.codes = Some(Sq8::build(dim, data, &cache.live));
+            }
         }
-        ix.remap(&new_slot);
-        self.index = Some(ix);
     }
 
-    pub fn has_index(&self) -> bool {
-        self.index.is_some()
-    }
 
-    /// Offers to `top` every committed row where the predicates and `rest`
-    /// hold and `skip` does not, through the index made by `prepare_index`.
-    /// Lists are visited by increasing lower bound, and the scan stops at the
-    /// first list that cannot beat the K-th distance so far, so `top` ends up
-    /// as if every row had been offered.
-    pub fn topk_indexed(
+    /// Offers to `top` every committed row of a cached table where the
+    /// predicates and `rest` hold and `skip` does not. With k-means lists,
+    /// lists are visited by increasing lower bound and the scan stops at the
+    /// first one that cannot beat the K-th distance so far; with codes, rows
+    /// they prove too far are passed over without reading their floats.
+    /// Either way `top` ends up as if every row had been offered.
+    pub fn topk(
         &self,
         preds: &[ColPred<'_>],
         skip: impl Fn(i64) -> bool,
         rest: impl Fn(&RowView<'_>) -> bool,
         top: &mut TopK<'_>,
     ) -> DbResult<()> {
-        let (Some(cache), Some(col), Some(ix)) = (&self.cache, self.vector_col, &self.index) else {
-            bail!(Internal, "vector index used before it was prepared");
+        let (Some(cache), Some(col)) = (&self.cache, self.vector_col) else {
+            bail!(Internal, "cached TopK on a table without cached vectors");
         };
         let probes: Option<Vec<Probe<'_>>> = preds.iter().map(|p| Probe::new(cache, p)).collect();
-        for (bound, l) in ix.order(top.query()) {
-            if top.kth().is_some_and(|kth| bound > kth) {
-                break;
+        let passes = |s: usize| match &probes {
+            Some(probes) => probes.iter().all(|p| p.holds(s)),
+            None => preds.iter().all(|p| p.test(&cache.view(s))),
+        };
+        let mut codes = self.codes.as_ref().map(|c| c.query(top.query()));
+        let mut kth = top.kth();
+        if let (Some(c), Some(k)) = (&mut codes, kth) {
+            c.set_kth(k);
+        }
+        let mut kept: Vec<u32> = Vec::with_capacity(BLOCK);
+        // Offers the candidates (all passing the predicates) that the codes
+        // keep, tightening the codes' bound whenever the K-th distance drops.
+        let mut run = |cand: Cand<'_>, top: &mut TopK<'_>| {
+            kept.clear();
+            match (&codes, cand) {
+                (Some(c), Cand::Run(slots)) => c.keep(slots, false, &mut kept),
+                (Some(c), Cand::Scattered(slots)) => c.keep(slots, true, &mut kept),
+                (Some(c), Cand::Live(range)) => c.keep_live(range, &cache.live, &mut kept),
+                (None, Cand::Run(slots) | Cand::Scattered(slots)) => kept.extend_from_slice(slots),
+                (None, Cand::Live(range)) => kept.extend(range.filter(|&s| cache.live[s]).map(|s| s as u32)),
             }
-            for &slot in ix.list(l) {
-                let s = slot as usize;
-                let row = cache.view(s);
-                let pass = match &probes {
-                    Some(probes) => probes.iter().all(|p| p.holds(s)),
-                    None => preds.iter().all(|p| p.test(&row)),
-                };
-                if pass && !skip(row.pk) && rest(&row) {
-                    if let ValRef::Vector(v) = cache.get(s, col) {
-                        top.offer(row.pk, v);
+            for &s in &kept {
+                let row = cache.view(s as usize);
+                if skip(row.pk) || !rest(&row) {
+                    continue;
+                }
+                if let ValRef::Vector(v) = cache.get(s as usize, col) {
+                    top.offer(row.pk, v);
+                    let k = top.kth();
+                    if k != kth {
+                        kth = k;
+                        if let (Some(c), Some(k)) = (&mut codes, k) {
+                            c.set_kth(k);
+                        }
+                    }
+                }
+            }
+        };
+        let filtered = !preds.is_empty();
+        let lists = self.index.as_ref().filter(|_| {
+            if !filtered {
+                return true;
+            }
+            let mut u = self.filtered_lists.get();
+            u.queries = u.queries.wrapping_add(1);
+            self.filtered_lists.set(u);
+            u.visited <= 0.5 || u.queries.is_multiple_of(16)
+        });
+        let mut block: Vec<u32> = Vec::with_capacity(BLOCK);
+        if let Some(ix) = lists {
+            let mut visited = 0usize;
+            for (bound, l) in ix.order(top.query()) {
+                if top.kth().is_some_and(|kth| bound > kth) {
+                    break;
+                }
+                let list = ix.list(l);
+                visited += list.len();
+                for chunk in list.chunks(BLOCK) {
+                    if filtered {
+                        block.clear();
+                        block.extend(chunk.iter().filter(|&&s| passes(s as usize)));
+                        run(Cand::Scattered(&block), top);
+                    } else {
+                        run(Cand::Run(chunk), top);
+                    }
+                }
+            }
+            if filtered {
+                let mut u = self.filtered_lists.get();
+                u.visited = 0.75 * u.visited + 0.25 * (visited as f32 / self.rows.len().max(1) as f32);
+                self.filtered_lists.set(u);
+            }
+            return Ok(());
+        }
+        match &probes {
+            Some(probes) if !probes.is_empty() => {
+                for chunk in select(cache, probes).chunks(BLOCK) {
+                    run(Cand::Scattered(chunk), top);
+                }
+            }
+            _ => {
+                for start in (0..cache.live.len()).step_by(BLOCK) {
+                    let end = (start + BLOCK).min(cache.live.len());
+                    if filtered {
+                        // Predicates the cache cannot probe: tested row by row.
+                        block.clear();
+                        block.extend((start..end).filter(|&s| cache.live[s] && passes(s)).map(|s| s as u32));
+                        run(Cand::Scattered(&block), top);
+                    } else {
+                        run(Cand::Live(start..end), top);
                     }
                 }
             }
@@ -735,12 +857,18 @@ mod tests {
         vec![Value::Str(s.into()), Value::Int(pk), Value::Vector(vec![pk as f32, -1.0]), Value::Int(n)]
     }
 
-    /// The index's TopK and a filtered scan equal offering every row of a
-    /// model, before and after the rows are relaid out, through updates and
-    /// deletes, with and without filters (`=`, `<>`, a value no row has, two
-    /// predicates).
+    /// The cached TopK equals offering every row of a model, with every
+    /// combination of lists and codes, before and after the rows are relaid
+    /// out, through updates and deletes, with and without filters (`=`,
+    /// `<>`, a value no row has, two predicates).
     #[test]
-    fn indexed_topk_matches_model() {
+    fn cached_topk_matches_model() {
+        for (lists, codes) in [(true, true), (true, false), (false, true), (false, false)] {
+            check_cached_topk(IndexOptions { min_rows: 1, lists, codes });
+        }
+    }
+
+    fn check_cached_topk(opts: IndexOptions) {
         let def = TableDef {
             id: 1,
             name: "t".into(),
@@ -779,10 +907,13 @@ mod tests {
             table.apply_delete(pk);
             model.remove(&pk);
         }
-        table.prepare_index(1);
-        assert!(table.has_index());
+        table.prepare_index(opts);
+        assert_eq!(table.index.is_some(), opts.lists);
+        assert_eq!(table.codes.is_some(), opts.codes);
         for pk in (1..3000).step_by(7) {
-            put(&mut table, &mut model, pk, point(pk as usize + 5));
+            // Some far outside the range the codes were fitted to.
+            let v = point(pk as usize + 5).iter().map(|c| if pk % 3 == 0 { c * 9.0 } else { *c }).collect();
+            put(&mut table, &mut model, pk, v);
         }
         for pk in 3000..3400 {
             put(&mut table, &mut model, pk, point(pk as usize));
@@ -795,8 +926,6 @@ mod tests {
             let e = table.rows[pk];
             assert_eq!(&table.cache.as_ref().unwrap().view(e.slot as usize).to_values(), row);
         }
-        let dir = std::env::temp_dir().join(format!("mvdb-ivf-test-{}", std::process::id()));
-        let log = LogStore::open(&dir, Default::default(), |_, _| Ok(())).unwrap();
         for qi in 0..200 {
             let q = point(qi);
             let k = [1, 5, 10, 50][qi % 4];
@@ -820,23 +949,10 @@ mod tests {
                     }
                 }
             }
-            let want = want.into_sorted();
-            let mut full = TopK::new(&q, k);
-            table
-                .scan_unordered(&log, i64::MIN..=i64::MAX, &preds, |row| {
-                    if let ValRef::Vector(v) = row.get(2) {
-                        full.offer(row.pk, v);
-                    }
-                    Ok(true)
-                })
-                .unwrap();
-            let mut indexed = TopK::new(&q, k);
-            table.topk_indexed(&preds, |_| false, |_| true, &mut indexed).unwrap();
-            assert_eq!(full.into_sorted(), want, "scan, query {qi}");
-            assert_eq!(indexed.into_sorted(), want, "index, query {qi}");
+            let mut got = TopK::new(&q, k);
+            table.topk(&preds, |_| false, |_| true, &mut got).unwrap();
+            assert_eq!(got.into_sorted(), want.into_sorted(), "{opts:?} query {qi}");
         }
-        drop(log);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Random puts and deletes against a model map, with string sizes that
