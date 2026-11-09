@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use crate::error::DbResult;
 use crate::types::Value;
 
 /// One output value.
@@ -28,9 +29,36 @@ pub enum ExecResult {
     Rows { columns: Vec<String>, rows: Vec<Vec<Cell>> },
 }
 
-impl ExecResult {
-    pub fn ok(affected: u64) -> ExecResult {
-        ExecResult::Ok { affected }
+/// What a statement did. A result set went to the statement's `RowSink`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Affected(u64),
+    Rows,
+}
+
+/// Receives a result set while it is produced: the column names, then each
+/// row in output order.
+pub trait RowSink {
+    fn columns(&mut self, names: &[String]) -> DbResult<()>;
+    fn row(&mut self, cells: &[Cell]) -> DbResult<()>;
+}
+
+/// Keeps a result set in memory.
+#[derive(Default)]
+pub struct Collect {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Cell>>,
+}
+
+impl RowSink for Collect {
+    fn columns(&mut self, names: &[String]) -> DbResult<()> {
+        self.columns = names.to_vec();
+        Ok(())
+    }
+
+    fn row(&mut self, cells: &[Cell]) -> DbResult<()> {
+        self.rows.push(cells.to_vec());
+        Ok(())
     }
 }
 

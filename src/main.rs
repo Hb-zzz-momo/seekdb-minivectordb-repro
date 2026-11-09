@@ -3,10 +3,10 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
 use minivectordb::db_err;
-use minivectordb::engine::result::ExecResult;
+use minivectordb::engine::result::{Outcome, RowSink};
 use minivectordb::engine::{Engine, EngineOptions};
 use minivectordb::error::DbResult;
-use minivectordb::protocol::{self, Format};
+use minivectordb::protocol::{self, Format, Response};
 use minivectordb::sql;
 
 fn main() {
@@ -51,8 +51,9 @@ fn main() {
         if protocol::is_exit(text) {
             break;
         }
-        let res = run(&mut engine, text);
-        let _ = protocol::write_result(&mut out, fmt, &res);
+        let mut response = Response::new(&mut out, fmt);
+        let res = run(&mut engine, text, &mut response);
+        let _ = response.finish(res);
         let _ = out.flush();
     }
     let _ = out.flush();
@@ -62,9 +63,8 @@ fn main() {
 
 /// Parses and executes one statement. A panic is reported as an error and
 /// rolls back the open transaction instead of taking the process down.
-fn run(engine: &mut Engine, text: &str) -> DbResult<ExecResult> {
-    let stmt = sql::parse(text)?;
-    match panic::catch_unwind(AssertUnwindSafe(|| engine.execute(&stmt))) {
+fn run(engine: &mut Engine, text: &str, sink: &mut dyn RowSink) -> DbResult<Outcome> {
+    match panic::catch_unwind(AssertUnwindSafe(|| engine.execute_into(&sql::parse(text)?, sink))) {
         Ok(res) => res,
         Err(_) => {
             engine.abort_transaction();

@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::ops::RangeInclusive;
 
 use super::expr::{compile, compile_filter, literal_value, pk_range, split_filter, CExpr, ColPred, Kind, Scope};
-use super::result::{cmp_cells, Cell, ExecResult};
+use super::result::{cmp_cells, Cell, RowSink};
 use super::table::{RowView, Table, ValRef};
 use super::topk::TopK;
 use super::txn::{Changes, Txn};
@@ -120,7 +120,7 @@ fn pk_of(values: &[Value], pk: usize) -> DbResult<i64> {
     }
 }
 
-pub(super) fn insert(tables: &Tables, txn: &mut Txn, ins: &Insert) -> DbResult<ExecResult> {
+pub(super) fn insert(tables: &Tables, txn: &mut Txn, ins: &Insert) -> DbResult<u64> {
     let id = tables.lookup(&ins.table)?;
     let table = tables.table(id)?;
     let def = &table.def;
@@ -155,10 +155,10 @@ pub(super) fn insert(tables: &Tables, txn: &mut Txn, ins: &Insert) -> DbResult<E
         }
         txn.write(id, pk, Some(values));
     }
-    Ok(ExecResult::ok(ins.rows.len() as u64))
+    Ok(ins.rows.len() as u64)
 }
 
-pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update) -> DbResult<ExecResult> {
+pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update) -> DbResult<u64> {
     let id = tables.lookup(&up.table)?;
     let table = tables.table(id)?;
     let def = &table.def;
@@ -196,10 +196,10 @@ pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update
             changed += 1;
         }
     }
-    Ok(ExecResult::ok(changed))
+    Ok(changed)
 }
 
-pub(super) fn delete(log: &LogStore, tables: &Tables, txn: &mut Txn, del: &Delete) -> DbResult<ExecResult> {
+pub(super) fn delete(log: &LogStore, tables: &Tables, txn: &mut Txn, del: &Delete) -> DbResult<u64> {
     let id = tables.lookup(&del.table)?;
     let table = tables.table(id)?;
     let scope = Scope { def: &table.def, alias: None };
@@ -216,10 +216,13 @@ pub(super) fn delete(log: &LogStore, tables: &Tables, txn: &mut Txn, del: &Delet
     for &pk in &doomed {
         txn.write(id, pk, None);
     }
-    Ok(ExecResult::ok(doomed.len() as u64))
+    Ok(doomed.len() as u64)
 }
 
-pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select) -> DbResult<ExecResult> {
+/// Runs a SELECT, sending rows to `sink` as they are produced. Only TopK
+/// (its K row ids) and ORDER BY on anything but the primary key (sort keys
+/// and row ids) hold state for the whole result; no path keeps output rows.
+pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select, sink: &mut dyn RowSink) -> DbResult<()> {
     let id = tables.lookup(&sel.table)?;
     let table = tables.table(id)?;
     let def = &table.def;
@@ -283,12 +286,24 @@ pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select) -
     let offset = usize::try_from(sel.offset.unwrap_or(0)).unwrap_or(usize::MAX);
     let limit = sel.limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX));
     let changes = txn.changes(id);
+    sink.columns(&columns)?;
     let Some(range) = pk_range(filter.as_ref(), def.pk) else {
-        return Ok(ExecResult::Rows { columns, rows: Vec::new() });
+        return Ok(());
     };
     if limit == Some(0) {
-        return Ok(ExecResult::Rows { columns, rows: Vec::new() });
+        return Ok(());
     }
+    let mut cells = Vec::with_capacity(outputs.len());
+    let mut emit = |row: &RowView<'_>| -> DbResult<()> {
+        cells.clear();
+        cells.extend(outputs.iter().map(|e| e.cell(row)));
+        sink.row(&cells)
+    };
+    let mut emit_pk = |pk: i64| -> DbResult<()> {
+        let values = get_visible(table, log, changes, pk)?
+            .ok_or_else(|| db_err!(Internal, "row {} vanished during a query", pk))?;
+        emit(&RowView::new(pk, &values))
+    };
     let passes = |row: &RowView<'_>| filter.as_ref().is_none_or(|f| f.test(row));
     // For unordered scans: column predicates go to the scan, the rest is
     // tested per row.
@@ -323,43 +338,51 @@ pub(super) fn select(log: &LogStore, tables: &Tables, txn: &Txn, sel: &Select) -
                 Ok(true)
             })?;
         }
-        let mut rows = Vec::new();
         for pk in top.into_sorted().into_iter().skip(offset) {
-            let values = get_visible(table, log, changes, pk)?
-                .ok_or_else(|| db_err!(Internal, "row {} vanished during a query", pk))?;
-            let view = RowView::new(pk, &values);
-            rows.push(outputs.iter().map(|e| e.cell(&view)).collect());
+            emit_pk(pk)?;
         }
-        return Ok(ExecResult::Rows { columns, rows });
+        return Ok(());
     }
 
-    // General path. Without ORDER BY rows come in pk order and we can stop
-    // as soon as LIMIT is satisfied; with it, the sort (pk breaks ties)
-    // fixes the order, so the scan may visit rows in any order.
-    let stop_after = if order.is_empty() { limit.map(|l| offset.saturating_add(l)) } else { None };
-    let mut found: Vec<(Vec<Cell>, i64, Vec<Cell>)> = Vec::new();
-    let mut keep = |row: RowView<'_>| {
-        let keys = order.iter().map(|(e, _)| e.cell(&row)).collect();
-        found.push((keys, row.pk, outputs.iter().map(|e| e.cell(&row)).collect()));
-        Ok(stop_after.is_none_or(|n| found.len() < n))
-    };
-    if order.is_empty() {
-        scan_visible(table, log, changes, range, &mut |row| if passes(&row) { keep(row) } else { Ok(true) })?;
-    } else {
-        scan_visible_unordered(table, log, changes, range, &preds, |row| if passes_rest(&row) { keep(row) } else { Ok(true) })?;
-    }
-    if !order.is_empty() {
-        found.sort_by(|a, b| {
-            for (i, (_, desc)) in order.iter().enumerate() {
-                let o = cmp_cells(&a.0[i], &b.0[i]);
-                let o = if *desc { o.reverse() } else { o };
-                if o != Ordering::Equal {
-                    return o;
-                }
+    // No ORDER BY, or ORDER BY the primary key ascending: rows stream out of
+    // the scan in pk order, which stops once LIMIT is satisfied.
+    if order.is_empty() || matches!(order.as_slice(), [(CExpr::Col(c), false)] if *c == def.pk) {
+        let (mut skip, mut left) = (offset, limit.unwrap_or(usize::MAX));
+        return scan_visible(table, log, changes, range, &mut |row| {
+            if !passes(&row) {
+                return Ok(true);
             }
-            a.1.cmp(&b.1)
+            if skip > 0 {
+                skip -= 1;
+                return Ok(true);
+            }
+            emit(&row)?;
+            left -= 1;
+            Ok(left > 0)
         });
     }
-    let rows = found.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).map(|(_, _, out)| out).collect();
-    Ok(ExecResult::Rows { columns, rows })
+
+    // Any other ORDER BY: sort the matching rows' keys (pk breaks ties, so
+    // the scan may visit rows in any order), then fetch the rows to output.
+    let mut found: Vec<(Vec<Cell>, i64)> = Vec::new();
+    scan_visible_unordered(table, log, changes, range, &preds, |row| {
+        if passes_rest(&row) {
+            found.push((order.iter().map(|(e, _)| e.cell(&row)).collect(), row.pk));
+        }
+        Ok(true)
+    })?;
+    found.sort_by(|a, b| {
+        for (i, (_, desc)) in order.iter().enumerate() {
+            let o = cmp_cells(&a.0[i], &b.0[i]);
+            let o = if *desc { o.reverse() } else { o };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        a.1.cmp(&b.1)
+    });
+    for (_, pk) in found.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)) {
+        emit_pk(pk)?;
+    }
+    Ok(())
 }

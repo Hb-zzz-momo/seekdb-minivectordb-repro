@@ -25,7 +25,7 @@ use crate::storage::log::{LogOptions, LogStore, Op, OpView};
 use crate::storage::row::{decode_row, encode_row};
 use crate::types::DataType;
 use crate::{bail, db_err};
-use result::ExecResult;
+use result::{Collect, ExecResult, Outcome, RowSink};
 use table::Table;
 use txn::Txn;
 
@@ -207,27 +207,38 @@ impl Engine {
         self.txn.explicit = false;
     }
 
+    /// Executes one statement, keeping a result set in memory.
     pub fn execute(&mut self, stmt: &Statement) -> DbResult<ExecResult> {
+        let mut rows = Collect::default();
+        Ok(match self.execute_into(stmt, &mut rows)? {
+            Outcome::Affected(affected) => ExecResult::Ok { affected },
+            Outcome::Rows => ExecResult::Rows { columns: rows.columns, rows: rows.rows },
+        })
+    }
+
+    /// Executes one statement. A SELECT sends its rows to `sink` as it
+    /// produces them.
+    pub fn execute_into(&mut self, stmt: &Statement, sink: &mut dyn RowSink) -> DbResult<Outcome> {
         match stmt {
             Statement::Begin => {
                 let r = self.commit();
                 self.txn.explicit = r.is_ok();
-                r.map(|_| ExecResult::ok(0))
+                r.map(|_| Outcome::Affected(0))
             }
             Statement::Commit => {
                 let r = self.commit();
                 self.txn.explicit = false;
-                r.map(|_| ExecResult::ok(0))
+                r.map(|_| Outcome::Affected(0))
             }
             Statement::Rollback => {
                 self.abort_transaction();
-                Ok(ExecResult::ok(0))
+                Ok(Outcome::Affected(0))
             }
             Statement::CreateTable(_) | Statement::DropTable { .. } | Statement::CreateVectorIndex(_) => {
                 let r = self.commit();
                 self.txn.explicit = false;
                 r?;
-                self.ddl(stmt)
+                self.ddl(stmt).map(|_| Outcome::Affected(0))
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
                 match stmt {
@@ -247,7 +258,7 @@ impl Engine {
                         if !self.txn.explicit {
                             self.commit()?;
                         }
-                        Ok(res)
+                        Ok(Outcome::Affected(res))
                     }
                     Err(e) => {
                         self.txn.undo_statement();
@@ -264,7 +275,8 @@ impl Engine {
                         t.prepare_index(self.tables.index);
                     }
                 }
-                query::select(&self.log, &self.tables, &self.txn, s)
+                query::select(&self.log, &self.tables, &self.txn, s, sink)?;
+                Ok(Outcome::Rows)
             }
             Statement::Set { name, value } => {
                 use crate::sql::ast::{Expr, Literal};
@@ -275,7 +287,7 @@ impl Engine {
                     _ => bail!(Unsupported, "unsupported value for SET {}", name),
                 };
                 self.vars.insert(name.to_ascii_lowercase(), v);
-                Ok(ExecResult::ok(0))
+                Ok(Outcome::Affected(0))
             }
         }
     }
@@ -337,12 +349,12 @@ impl Engine {
         Ok(())
     }
 
-    fn ddl(&mut self, stmt: &Statement) -> DbResult<ExecResult> {
+    fn ddl(&mut self, stmt: &Statement) -> DbResult<()> {
         match stmt {
             Statement::CreateTable(ct) => {
                 if self.tables.by_name.contains_key(&ct.name.to_ascii_lowercase()) {
                     if ct.if_not_exists {
-                        return Ok(ExecResult::ok(0));
+                        return Ok(());
                     }
                     bail!(TableExists, "table '{}' already exists", ct.name);
                 }
@@ -353,7 +365,7 @@ impl Engine {
             Statement::DropTable { name, if_exists } => {
                 let id = match self.tables.lookup(name) {
                     Ok(id) => id,
-                    Err(_) if *if_exists => return Ok(ExecResult::ok(0)),
+                    Err(_) if *if_exists => return Ok(()),
                     Err(e) => return Err(e),
                 };
                 self.log.append(&[Op::DropTable { table: id }])?;
@@ -378,7 +390,7 @@ impl Engine {
             }
             _ => bail!(Internal, "not a DDL statement"),
         }
-        Ok(ExecResult::ok(0))
+        Ok(())
     }
 }
 

@@ -6,8 +6,8 @@
 
 use std::io::{self, Write};
 
-use crate::engine::result::{Cell, ExecResult};
-use crate::error::DbResult;
+use crate::engine::result::{Cell, Outcome, RowSink};
+use crate::error::{DbError, DbResult};
 use crate::sql::parser::is_blank;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,70 +50,115 @@ pub fn write_ready(out: &mut impl Write, fmt: Format) -> io::Result<()> {
     }
 }
 
-pub fn write_result(out: &mut impl Write, fmt: Format, res: &DbResult<ExecResult>) -> io::Result<()> {
-    match fmt {
-        Format::Jsonl => write_jsonl(out, res),
-        Format::Text => write_text(out, res),
+/// Bytes of a response held back before rows start going out.
+const SPILL: usize = 64 << 10;
+
+/// One statement's response. Rows are formatted into a buffer that is
+/// written out whenever it passes `SPILL` bytes, so a result set of any size
+/// needs bounded memory. A statement that fails before anything was written
+/// gets a plain error response; one that fails after rows went out (an I/O
+/// error reading the table) gets the error appended to them.
+pub struct Response<'a, W: Write> {
+    out: &'a mut W,
+    fmt: Format,
+    buf: String,
+    columns: bool,
+    rows: u64,
+    spilled: bool,
+}
+
+impl<'a, W: Write> Response<'a, W> {
+    pub fn new(out: &'a mut W, fmt: Format) -> Self {
+        Response { out, fmt, buf: String::new(), columns: false, rows: 0, spilled: false }
+    }
+
+    /// Completes the response with the statement's outcome.
+    pub fn finish(mut self, res: DbResult<Outcome>) -> io::Result<()> {
+        match res {
+            Ok(Outcome::Rows) => {
+                if !self.columns {
+                    let _ = self.columns(&[]);
+                }
+                if self.fmt == Format::Jsonl {
+                    self.buf.push_str("]}\n");
+                }
+            }
+            Ok(Outcome::Affected(n)) => {
+                self.buf.clear();
+                match self.fmt {
+                    Format::Jsonl => self.buf.push_str(&format!("{{\"ok\":true,\"affected\":{n}}}\n")),
+                    Format::Text => self.buf.push_str(&format!("OK {n}\n")),
+                }
+            }
+            Err(e) => {
+                if !self.spilled {
+                    self.buf.clear();
+                }
+                self.error(&e);
+            }
+        }
+        self.out.write_all(self.buf.as_bytes())
+    }
+
+    fn error(&mut self, e: &DbError) {
+        match self.fmt {
+            Format::Jsonl => {
+                // After rows went out: close their array and add the error.
+                let head = if self.spilled { "]," } else { "{" };
+                self.buf.push_str(&format!("{head}\"error\":\"{}\",\"message\":", e.kind.name()));
+                push_json_str(&mut self.buf, &e.msg);
+                self.buf.push_str("}\n");
+            }
+            Format::Text => self.buf.push_str(&format!("ERROR {}: {}\n", e.kind.name(), e.msg)),
+        }
     }
 }
 
-fn write_text(out: &mut impl Write, res: &DbResult<ExecResult>) -> io::Result<()> {
-    match res {
-        Ok(ExecResult::Ok { affected }) => writeln!(out, "OK {affected}"),
-        Ok(ExecResult::Rows { columns, rows }) => {
-            writeln!(out, "{}", columns.join("\t"))?;
-            let mut line = String::new();
-            for row in rows {
-                line.clear();
-                for (i, cell) in row.iter().enumerate() {
+impl<W: Write> RowSink for Response<'_, W> {
+    fn columns(&mut self, names: &[String]) -> DbResult<()> {
+        match self.fmt {
+            Format::Jsonl => {
+                self.buf.push_str("{\"columns\":[");
+                for (i, c) in names.iter().enumerate() {
                     if i > 0 {
-                        line.push('\t');
+                        self.buf.push(',');
                     }
-                    push_cell(&mut line, cell, false);
+                    push_json_str(&mut self.buf, c);
                 }
-                writeln!(out, "{line}")?;
+                self.buf.push_str("],\"rows\":[");
             }
-            Ok(())
+            Format::Text => {
+                self.buf.push_str(&names.join("\t"));
+                self.buf.push('\n');
+            }
         }
-        Err(e) => writeln!(out, "ERROR {}: {}", e.kind.name(), e.msg),
+        self.columns = true;
+        Ok(())
     }
-}
 
-fn write_jsonl(out: &mut impl Write, res: &DbResult<ExecResult>) -> io::Result<()> {
-    let mut s = String::new();
-    match res {
-        Ok(ExecResult::Ok { affected }) => s.push_str(&format!("{{\"ok\":true,\"affected\":{affected}}}")),
-        Ok(ExecResult::Rows { columns, rows }) => {
-            s.push_str("{\"columns\":[");
-            for (i, c) in columns.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                push_json_str(&mut s, c);
+    fn row(&mut self, cells: &[Cell]) -> DbResult<()> {
+        let json = self.fmt == Format::Jsonl;
+        if json {
+            if self.rows > 0 {
+                self.buf.push(',');
             }
-            s.push_str("],\"rows\":[");
-            for (i, row) in rows.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push('[');
-                for (j, cell) in row.iter().enumerate() {
-                    if j > 0 {
-                        s.push(',');
-                    }
-                    push_cell(&mut s, cell, true);
-                }
-                s.push(']');
+            self.buf.push('[');
+        }
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                self.buf.push(if json { ',' } else { '\t' });
             }
-            s.push_str("]}");
+            push_cell(&mut self.buf, cell, json);
         }
-        Err(e) => {
-            s.push_str(&format!("{{\"error\":\"{}\",\"message\":", e.kind.name()));
-            push_json_str(&mut s, &e.msg);
-            s.push('}');
+        self.buf.push(if json { ']' } else { '\n' });
+        self.rows += 1;
+        if self.buf.len() >= SPILL {
+            self.out.write_all(self.buf.as_bytes())?;
+            self.buf.clear();
+            self.spilled = true;
         }
+        Ok(())
     }
-    writeln!(out, "{s}")
 }
 
 fn push_cell(s: &mut String, cell: &Cell, json: bool) {
@@ -162,6 +207,20 @@ fn push_json_str(s: &mut String, v: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db_err;
+
+    fn respond(fmt: Format, rows: usize, res: DbResult<Outcome>) -> String {
+        let mut out = Vec::new();
+        let mut r = Response::new(&mut out, fmt);
+        if matches!(res, Ok(Outcome::Rows)) || rows > 0 {
+            r.columns(&["id".into(), "v".into()]).unwrap();
+        }
+        for i in 0..rows {
+            r.row(&[Cell::Int(i as i64), Cell::Str("a\"b".into())]).unwrap();
+        }
+        r.finish(res).unwrap();
+        String::from_utf8(out).unwrap()
+    }
 
     #[test]
     fn one_statement_per_line() {
@@ -170,5 +229,32 @@ mod tests {
         assert_eq!(statement(" -- note\n"), None);
         assert_eq!(statement("\n"), None);
         assert!(is_exit("quit;") && is_exit("EXIT") && !is_exit("quit_it"));
+    }
+
+    #[test]
+    fn responses() {
+        assert_eq!(respond(Format::Jsonl, 0, Ok(Outcome::Affected(3))), "{\"ok\":true,\"affected\":3}\n");
+        assert_eq!(
+            respond(Format::Jsonl, 2, Ok(Outcome::Rows)),
+            "{\"columns\":[\"id\",\"v\"],\"rows\":[[0,\"a\\\"b\"],[1,\"a\\\"b\"]]}\n"
+        );
+        assert_eq!(respond(Format::Text, 1, Ok(Outcome::Rows)), "id\tv\n0\ta\"b\n");
+        let err = || Err(db_err!(DuplicateKey, "dup"));
+        assert_eq!(respond(Format::Jsonl, 0, err()), "{\"error\":\"duplicate_key\",\"message\":\"dup\"}\n");
+        // An error after a few rows that were never written replaces them.
+        assert_eq!(respond(Format::Jsonl, 3, err()), "{\"error\":\"duplicate_key\",\"message\":\"dup\"}\n");
+        assert_eq!(respond(Format::Text, 3, err()), "ERROR duplicate_key: dup\n");
+    }
+
+    #[test]
+    fn large_results_stream_and_stay_valid_json() {
+        let n = 20_000;
+        let line = respond(Format::Jsonl, n, Ok(Outcome::Rows));
+        let v: Vec<&str> = line.matches("[").collect();
+        assert_eq!(v.len(), n + 2);
+        assert!(line.ends_with("]]}\n") && line.lines().count() == 1);
+        // Rows already went out, so the error is appended to them.
+        let failed = respond(Format::Jsonl, n, Err(db_err!(Io, "disk")));
+        assert!(failed.len() >= SPILL && failed.ends_with("],\"error\":\"io_error\",\"message\":\"disk\"}\n"));
     }
 }
