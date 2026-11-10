@@ -218,7 +218,8 @@ about 30% (5.5 against 4.2 ms per TopK at 100,000 rows). About 45 ms of each
 figure is the benchmark's own round trips (`--floor`).
 
 Environment variables for experiments only: `MVDB_CACHE_BYTES` (row cache
-budget; default a quarter of the cgroup memory limit),
+budget; default a quarter of the memory limit of the process's cgroup or of
+any group above it, read from `/proc/self/cgroup` and `/sys/fs/cgroup`),
 `MVDB_DROP_CACHE=0` (keep log pages in the page cache), `MVDB_IVF=0` and
 `MVDB_SQ8=0` (leave out the lists or the codes), `MVDB_IVF_MIN_ROWS`
 (table size from which the index is used; the differential tests set it

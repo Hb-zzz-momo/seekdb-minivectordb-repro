@@ -18,6 +18,7 @@ mod txn;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::cgroup;
 use crate::error::DbResult;
 use crate::sql::ast::{CreateTable, Statement};
 use crate::storage::catalog::{Column, TableDef};
@@ -77,15 +78,23 @@ pub fn default_index_options() -> IndexOptions {
     }
 }
 
-/// `MVDB_CACHE_BYTES`, else a quarter of the cgroup memory limit, else 256 MiB.
+/// `MVDB_CACHE_BYTES`, else a quarter of the memory this process may use.
 pub fn default_cache_budget() -> usize {
     if let Some(n) = std::env::var("MVDB_CACHE_BYTES").ok().and_then(|v| v.parse().ok()) {
         return n;
     }
-    let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok().and_then(|s| s.trim().parse::<u64>().ok());
-    match limit {
-        Some(l) => ((l / 4) as usize).clamp(4 << 20, 1 << 30),
-        None => 256 << 20,
+    cache_budget(cgroup::memory_limit(), cgroup::mem_total())
+}
+
+/// A quarter of the cgroup memory limit (or of the machine's memory when
+/// that is smaller), between 4 MiB and 1 GiB. Without a limit: a quarter of
+/// the machine's memory, at most 256 MiB.
+fn cache_budget(limit: Option<u64>, mem_total: Option<u64>) -> usize {
+    let quarter = |bytes: u64| usize::try_from(bytes / 4).unwrap_or(usize::MAX);
+    match (limit, mem_total) {
+        (Some(l), m) => quarter(l.min(m.unwrap_or(u64::MAX))).clamp(4 << 20, 1 << 30),
+        (None, Some(m)) => quarter(m).clamp(4 << 20, 256 << 20),
+        (None, None) => 256 << 20,
     }
 }
 
@@ -439,4 +448,26 @@ fn table_def(ct: &CreateTable, id: u32) -> DbResult<TableDef> {
         bail!(Schema, "a table can have at most one vector column");
     }
     Ok(TableDef { id, name: ct.name.clone(), columns, pk, vector_index: None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_budgets() {
+        const MIB: u64 = 1 << 20;
+        // A quarter of the limit, as in the judge's 2 GiB container.
+        assert_eq!(cache_budget(Some(2048 * MIB), Some(16000 * MIB)), 512 << 20);
+        assert_eq!(cache_budget(Some(64 * MIB), None), 16 << 20);
+        // Never below 4 MiB or above 1 GiB.
+        assert_eq!(cache_budget(Some(8 * MIB), Some(16000 * MIB)), 4 << 20);
+        assert_eq!(cache_budget(Some(64000 * MIB), Some(128000 * MIB)), 1 << 30);
+        // A limit above the machine's memory is not a limit.
+        assert_eq!(cache_budget(Some(64000 * MIB), Some(1024 * MIB)), 256 << 20);
+        // No limit: a quarter of the machine, at most 256 MiB.
+        assert_eq!(cache_budget(None, Some(16000 * MIB)), 256 << 20);
+        assert_eq!(cache_budget(None, Some(512 * MIB)), 128 << 20);
+        assert_eq!(cache_budget(None, None), 256 << 20);
+    }
 }

@@ -1,3 +1,4 @@
+pub mod cgroup;
 pub mod engine;
 pub mod error;
 pub mod protocol;
