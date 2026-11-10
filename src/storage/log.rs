@@ -198,9 +198,9 @@ impl LogStore {
         Ok(())
     }
 
-    /// Streams every committed frame again, oldest first, dropping each
-    /// segment from the page cache once read. For scans over tables too large
-    /// to keep in memory.
+    /// Streams every committed frame again, oldest first, dropping the pages
+    /// it has read from the page cache as it goes. Used to rebuild a table's
+    /// row cache.
     pub fn scan(&self, mut f: impl FnMut(u64, &[OpView<'_>]) -> DbResult<()>) -> DbResult<()> {
         let mut payload = Vec::new();
         for seg in &self.segs {
@@ -208,8 +208,11 @@ impl LogStore {
             if end != seg.len {
                 bail!(Corrupt, "segment {} changed under a scan", seg.id);
             }
-            if seg.id != self.active_id() && self.opts.drop_cache {
-                drop_cache(&seg.file, 0, seg.len);
+            if self.opts.drop_cache {
+                // Not the partial last page of the active segment: the next
+                // append writes into it and would have to read it back.
+                let upto = if seg.id == self.active_id() { seg.len & !(PAGE - 1) } else { seg.len };
+                drop_cache(&seg.file, 0, upto);
             }
         }
         Ok(())

@@ -127,7 +127,13 @@ through the general parser. What remains of the write phase is mostly the
 
 A table that is written to before anything reads it (a bulk load) keeps no
 decoded rows in memory: its row cache is set aside at the first commit and
-rebuilt from the log by the first statement that reads the table. Recovery
+rebuilt from the log by the first statement that reads the table (or by
+`CREATE VECTOR INDEX`). The rebuild reads the log front to back, as recovery
+does, dropping pages behind itself: with the load and the queries in one
+process the peak is 8.2 MiB, against 13.3 MiB when the rows were fetched one
+by one, which left the whole log in the page cache. `MVDB_DEFER_CACHE=0`
+keeps the rows in memory during the load instead (load peak 7.0 MiB, and no
+second read of the log). Recovery
 still decodes rows while it replays the log, since it reads them anyway, so
 a database reopened for queries starts with its cache ready.
 
@@ -222,7 +228,9 @@ figure is the benchmark's own round trips (`--floor`).
 Environment variables for experiments only: `MVDB_CACHE_BYTES` (row cache
 budget; default a quarter of the memory limit of the process's cgroup or of
 any group above it, read from `/proc/self/cgroup` and `/sys/fs/cgroup`),
-`MVDB_DROP_CACHE=0` (keep log pages in the page cache), `MVDB_IVF=0` and
+`MVDB_DROP_CACHE=0` (keep log pages in the page cache),
+`MVDB_DEFER_CACHE=0` (keep a table's rows in memory while it is only written
+to), `MVDB_IVF=0` and
 `MVDB_SQ8=0` (leave out the lists or the codes), `MVDB_IVF_MIN_ROWS`
 (table size from which the index is used; the differential tests set it
 to 1) and `MVDB_IVF_MAX_ROWS` (largest table that gets lists).

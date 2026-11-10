@@ -31,6 +31,7 @@ use result::{Collect, ExecResult, Outcome, RowSink};
 use table::Table;
 use txn::Txn;
 
+#[derive(Debug, Clone)]
 pub struct EngineOptions {
     pub log: LogOptions,
     /// Bytes of decoded rows kept in memory across all tables.
@@ -38,6 +39,11 @@ pub struct EngineOptions {
     /// When tables get a vector index for TopK, and which parts.
     pub index: IndexOptions,
     pub semantics: Semantics,
+    /// Set a table's row cache aside while it is only written to (a bulk
+    /// load) and rebuild it from the log at the first read. Saves the load's
+    /// memory; costs one more pass over the log if the same process then
+    /// queries the table. `MVDB_DEFER_CACHE=0` turns it off.
+    pub defer_cache: bool,
 }
 
 /// Choices the task text leaves open, in one place: if a formal attempt
@@ -100,6 +106,7 @@ impl Default for EngineOptions {
             cache_budget: default_cache_budget(),
             index: default_index_options(),
             semantics: Semantics::from_env(),
+            defer_cache: std::env::var("MVDB_DEFER_CACHE").map_or(true, |v| v != "0"),
         }
     }
 }
@@ -227,6 +234,7 @@ pub struct Engine {
     txn: Txn,
     vars: HashMap<String, String>,
     semantics: Semantics,
+    defer_cache: bool,
 }
 
 impl Engine {
@@ -246,7 +254,7 @@ impl Engine {
             t.prepare_index(opts.index);
         }
         tables.enforce_budget();
-        Ok(Engine { log, tables, txn: Txn::default(), vars: HashMap::new(), semantics: opts.semantics })
+        Ok(Engine { log, tables, txn: Txn::default(), vars: HashMap::new(), semantics: opts.semantics, defer_cache: opts.defer_cache })
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -405,7 +413,7 @@ impl Engine {
         let mut locs = self.log.append(&ops)?.into_iter();
         for (id, rows) in changes {
             let Some(table) = self.tables.by_id.get_mut(&id) else { continue };
-            if !table.read {
+            if !table.read && self.defer_cache {
                 table.defer_cache();
             }
             for (pk, row) in rows {
@@ -520,20 +528,41 @@ mod tests {
     struct TestDb {
         engine: Engine,
         dir: PathBuf,
+        opts: EngineOptions,
+    }
+
+    fn options() -> EngineOptions {
+        EngineOptions {
+            log: LogOptions { sync: false, ..LogOptions::default() },
+            cache_budget: 64 << 20,
+            index: default_index_options(),
+            semantics: Semantics::default(),
+            defer_cache: true,
+        }
     }
 
     impl TestDb {
         fn new(semantics: Semantics, index: IndexOptions) -> TestDb {
+            TestDb::open(EngineOptions { index, semantics, ..options() })
+        }
+
+        fn open(opts: EngineOptions) -> TestDb {
             static N: AtomicU32 = AtomicU32::new(0);
             let dir = std::env::temp_dir().join(format!("mvdb-engine-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
             let _ = std::fs::remove_dir_all(&dir);
-            let opts = EngineOptions {
-                log: LogOptions { sync: false, ..LogOptions::default() },
-                cache_budget: 64 << 20,
-                index,
-                semantics,
-            };
-            TestDb { engine: Engine::open(&dir, opts).unwrap(), dir }
+            TestDb { engine: Engine::open(&dir, opts.clone()).unwrap(), dir, opts }
+        }
+
+        /// A restart on the same directory.
+        fn reopen(&mut self) {
+            self.engine = Engine::open(&self.dir, self.opts.clone()).unwrap();
+        }
+
+        fn rows(&mut self, sql: &str) -> Vec<Vec<Cell>> {
+            match self.run(sql) {
+                Ok(ExecResult::Rows { rows, .. }) => rows,
+                other => panic!("{sql}: {other:?}"),
+            }
         }
 
         fn run(&mut self, sql: &str) -> DbResult<ExecResult> {
@@ -632,6 +661,71 @@ mod tests {
         assert!(!only_table(&db).is_cached());
         assert_eq!(db.ids("SELECT id FROM t ORDER BY L2_DISTANCE(v, '[7.2, 1]') LIMIT 3"), [7, 8, 6]);
         assert_eq!(only_table(&db).index_parts(), (true, true));
+    }
+
+    /// A table written to before it is read keeps no rows in memory; the
+    /// first read rebuilds its cache from the log, which by then also holds
+    /// older versions of rows and rows that were deleted.
+    #[test]
+    fn deferred_cache_is_rebuilt_from_the_live_rows() {
+        let mut db = TestDb::new(Semantics::default(), default_index_options());
+        db.run("CREATE TABLE other (id BIGINT PRIMARY KEY, c VARCHAR(8))").unwrap();
+        db.run("CREATE TABLE t (id BIGINT PRIMARY KEY, c VARCHAR(8), n BIGINT, v VECTOR(2))").unwrap();
+        for i in 1..=30 {
+            db.run(&format!("INSERT INTO t VALUES ({i}, 'a', {}, '[{i}, 0.5]')", i * 10)).unwrap();
+            db.run(&format!("INSERT INTO other VALUES ({i}, 'x')")).unwrap();
+        }
+        assert_eq!(db.affected("UPDATE t SET c = 'u' WHERE id <= 10"), 10);
+        assert_eq!(db.affected("DELETE FROM t WHERE id > 25"), 5);
+        assert_eq!(db.affected("UPDATE t SET c = 'w', v = '[9, 9]' WHERE id = 3"), 1);
+        db.reopen();
+        for i in 100..110 {
+            db.run(&format!("INSERT INTO t VALUES ({i}, 'b', {}, '[{i}, 0.5]')", i * 10)).unwrap();
+        }
+        let table = |db: &TestDb| db.engine.tables.by_id.values().find(|t| t.def.name == "t").unwrap().is_cached();
+        assert!(!table(&db), "set aside by the writes");
+        let got = db.rows("SELECT * FROM t");
+        assert!(table(&db), "rebuilt by the read");
+        let want: Vec<Vec<Cell>> = (1..=25)
+            .chain(100..110)
+            .map(|i: i64| {
+                let c = if i == 3 { "w" } else if i <= 10 { "u" } else if i < 100 { "a" } else { "b" };
+                let v = if i == 3 { vec![9.0, 9.0] } else { vec![i as f32, 0.5] };
+                vec![Cell::Int(i), Cell::Str(c.into()), Cell::Int(i * 10), Cell::Vector(v)]
+            })
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(db.ids("SELECT id FROM t ORDER BY L2_DISTANCE(v, '[9, 8]') LIMIT 2"), [3, 9]);
+    }
+
+    /// A table whose rows turn out not to fit the budget while they are
+    /// being loaded stays uncached and is still read correctly.
+    #[test]
+    fn deferred_cache_that_does_not_fit_is_given_up() {
+        // The size estimate does not count string contents, so the rows pass
+        // it and exceed the budget only during the load.
+        let mut db = TestDb::open(EngineOptions { cache_budget: 3000, ..options() });
+        db.run("CREATE TABLE t (id BIGINT PRIMARY KEY, c VARCHAR(400))").unwrap();
+        for i in 0..20 {
+            db.run(&format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(300))).unwrap();
+        }
+        assert_eq!(db.ids("SELECT id FROM t WHERE id >= 17"), [17, 18, 19]);
+        assert!(!only_table(&db).is_cached());
+        assert_eq!(db.affected("UPDATE t SET c = 'short' WHERE id = 18"), 1);
+        assert_eq!(db.rows("SELECT c FROM t WHERE id = 18"), [[Cell::Str("short".into())]]);
+    }
+
+    /// With the deferral off a table keeps its rows in memory through a
+    /// bulk load.
+    #[test]
+    fn deferral_can_be_turned_off() {
+        let mut db = TestDb::open(EngineOptions { defer_cache: false, ..options() });
+        db.run("CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))").unwrap();
+        for i in 0..20 {
+            db.run(&format!("INSERT INTO t VALUES ({i}, '[{i}, 1]')")).unwrap();
+        }
+        assert!(only_table(&db).is_cached());
+        assert_eq!(db.ids("SELECT id FROM t ORDER BY L2_DISTANCE(v, '[7.2, 1]') LIMIT 3"), [7, 8, 6]);
     }
 
     #[test]

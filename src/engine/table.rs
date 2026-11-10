@@ -16,7 +16,7 @@ use super::topk::TopK;
 use crate::error::DbResult;
 use crate::sql::ast::CmpOp;
 use crate::storage::catalog::TableDef;
-use crate::storage::log::{LogStore, RowLoc};
+use crate::storage::log::{LogStore, OpView, RowLoc};
 use crate::storage::row::decode_row;
 use crate::types::{DataType, Value};
 use crate::bail;
@@ -537,33 +537,54 @@ impl Table {
     /// Marks the table as read and rebuilds a deferred cache from the log.
     /// A table that would take more than `budget` bytes stays read from the
     /// log, as if its cache had been dropped for size.
+    ///
+    /// The log is read front to back, the way recovery reads it, which
+    /// drops its pages from the page cache behind itself: reading row by
+    /// row instead left the whole log in the page cache next to the new
+    /// cache. Of all the versions of a row in the log, the live one is the
+    /// one its index entry points at.
     pub fn load_cache(&mut self, log: &LogStore, budget: usize) -> DbResult<()> {
         self.read = true;
         if !std::mem::take(&mut self.deferred) {
             return Ok(());
         }
-        let too_big = || {
-            eprintln!("engine: table {} does not fit the {} byte row cache; reading it from disk", self.def.name, budget);
-            Ok(())
+        let too_big = |name: &str| {
+            eprintln!("engine: table {name} does not fit the {budget} byte row cache; reading it from disk");
         };
         if RowCache::estimate(&self.def, self.rows.len()) > budget {
-            return too_big();
+            too_big(&self.def.name);
+            return Ok(());
         }
         let mut cache = RowCache::new(&self.def);
         cache.reserve(self.rows.len());
-        let mut slots = Vec::with_capacity(self.rows.len());
-        let mut buf = Vec::new();
-        for (&pk, e) in &self.rows {
-            log.read(e.loc, &mut buf)?;
-            slots.push(cache.insert(pk, decode_row(&self.def, pk, &buf)?));
-            if cache.bytes() > budget {
-                return too_big();
+        let (def, rows) = (&self.def, &mut self.rows);
+        let (mut loaded, mut fits) = (0usize, true);
+        let scanned = log.scan(|_, ops| {
+            for op in ops {
+                let OpView::Put { table, pk, row, loc } = op else { continue };
+                if !fits || *table != def.id {
+                    continue;
+                }
+                let Some(e) = rows.get_mut(pk).filter(|e| e.loc == *loc) else { continue };
+                e.slot = cache.insert(*pk, decode_row(def, *pk, row)?);
+                loaded += 1;
+                fits = cache.bytes() <= budget;
             }
+            Ok(())
+        });
+        if scanned.is_ok() && fits && loaded == self.rows.len() {
+            self.cache = Some(cache);
+            return Ok(());
         }
-        for (e, slot) in self.rows.values_mut().zip(slots) {
-            e.slot = slot;
+        // No cache after all: no entry may keep a slot of the abandoned one.
+        for e in self.rows.values_mut() {
+            e.slot = NO_SLOT;
         }
-        self.cache = Some(cache);
+        scanned?;
+        if fits {
+            bail!(Internal, "the log holds {} of the {} rows of table {}", loaded, self.rows.len(), self.def.name);
+        }
+        too_big(&self.def.name);
         Ok(())
     }
 
