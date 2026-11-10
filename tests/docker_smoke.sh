@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test of the evaluation image, run the way the judge runs it
 # (STDIO_PROTOCOL.md): JSON requests on stdin, JSON responses on stdout, a
-# read-only root file system, no capabilities, no network.
+# read-only root file system, no capabilities, no network. Also: data
+# surviving a restart and a SIGKILL of the container, and `docker stop`.
 #
 #   docker build -t minivectordb:smoke .
 #   tests/docker_smoke.sh [image]
@@ -95,5 +96,20 @@ expect_line "$out" '{"id":1,"ok":true,"columns":["id"],"rows":[[1],[2],[3],[4]]}
 
 echo "5. clean exit at end of input without a shutdown request"
 docker run -i --rm "${JUDGE[@]}" -v "$VOL":/data "$IMAGE" </dev/null >/dev/null 2>&1 || fail "non-zero exit at end of input"
+
+echo "6. docker stop is a prompt, clean exit"
+docker run -i --name "$NAME" "${JUDGE[@]}" -v "$VOL":/data "$IMAGE" <"$TMP/in" >"$TMP/out" 2>&1 &
+exec 3>"$TMP/in"
+for _ in $(seq 100); do
+    grep -qF '{"type":"ready"}' "$TMP/out" 2>/dev/null && break
+    sleep 0.1
+done
+start=$(date +%s)
+docker stop "$NAME" >/dev/null
+[ $(($(date +%s) - start)) -le 3 ] || fail "docker stop took $(($(date +%s) - start)) s"
+exec 3>&-
+wait || true
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$NAME")" = 0 ] || fail "exit code $(docker inspect -f '{{.State.ExitCode}}' "$NAME") after docker stop"
+docker rm "$NAME" >/dev/null
 
 echo "PASS ($IMAGE, $(docker image inspect -f '{{.Size}}' "$IMAGE" | awk '{printf "%.1f MB", $1 / 1e6}'))"

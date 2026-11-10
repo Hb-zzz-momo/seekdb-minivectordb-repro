@@ -10,6 +10,7 @@ use minivectordb::protocol::{self, Op, Request, Response};
 use minivectordb::sql;
 
 fn main() {
+    exit_on_termination_signals();
     // `--data-dir`, else MVDB_DATA_DIR, else the variable the organizers'
     // checker sets for a local run, else /data.
     let mut data_dir = std::env::var("MVDB_DATA_DIR")
@@ -84,6 +85,31 @@ fn main() {
     }
     // End of input without a shutdown request: dropping the engine discards
     // any open transaction; every committed one is already durable.
+}
+
+/// SIGTERM and SIGINT end the session like end of input. Every acknowledged
+/// commit is already durable and an open transaction exists only in memory,
+/// so leaving at once is a normal shutdown that rolls it back; a frame cut
+/// off by the exit is a torn tail, which recovery discards. The handler is
+/// needed for `docker stop` to work at all: the database is process 1 in its
+/// container, and the kernel delivers SIGTERM to process 1 only if it has
+/// installed a handler.
+fn exit_on_termination_signals() {
+    extern "C" {
+        fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+        fn _exit(code: i32) -> !;
+    }
+    extern "C" fn on_signal(_: i32) {
+        // SAFETY: _exit is async-signal-safe.
+        unsafe { _exit(0) }
+    }
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    // SAFETY: the handler only calls an async-signal-safe function.
+    unsafe {
+        signal(SIGTERM, on_signal);
+        signal(SIGINT, on_signal);
+    }
 }
 
 /// Parses and executes one statement. A panic is reported as an error and

@@ -81,7 +81,8 @@ The smoke test runs the image with the judge's container options
 capabilities, a volume at `/data`): the organizers' checker (handshake and
 all public cases), then statements, a rolled-back transaction, a filtered
 TopK, data surviving a restart, an acknowledged commit surviving
-`docker kill`, and a clean exit at end of input.
+`docker kill`, a clean exit at end of input, and `docker stop` returning at
+once with exit code 0.
 
 ## Performance
 
@@ -280,8 +281,9 @@ one object per line in each direction, flushed after every line.
   - a failure: `{"id":N,"ok":false,"error":{"code":"...","message":"..."}}`,
     after which the session continues.
 - `{"id":N,"op":"shutdown"}` rolls back an open transaction, answers
-  `{"id":N,"ok":true}` and exits with status 0. End of input without it also
-  exits with status 0.
+  `{"id":N,"ok":true}` and exits with status 0. End of input without it,
+  SIGTERM (`docker stop`) and SIGINT also end the session with status 0 and
+  the open transaction rolled back.
 - `search_mode` may be `exact` or `ann`. Vector searches are exact in both:
   an exact answer satisfies every check on an approximate one.
 - BIGINT values are JSON integers, distances and vector elements are JSON
