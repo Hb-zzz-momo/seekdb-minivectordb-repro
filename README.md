@@ -94,14 +94,18 @@ once with exit code 0.
 cargo build --release
 python3 bench/bench.py                               # write phase, then query phase
 python3 bench/bench.py --env MVDB_DROP_CACHE=0       # same, without page-cache dropping
-python3 bench/bench.py --docker minivectordb:smoke   # inside the image, with io.stat
+python3 bench/bench.py --docker minivectordb:smoke --cpus 2   # inside the image, with io.stat
 python3 bench/bench.py --phase query --floor         # same queries, scan removed
 python3 bench/bench.py --clusters 50 --sigma 0.15    # Gaussian clusters instead of uniform data
 ```
 
 `bench/bench.py` follows the task's benchmark: 10,000 rows of 128-d vectors
 inserted 100 per commit, then a cold restart and 1,000 TopK queries (K = 10,
-every second one with an equality filter). Each phase runs in its own
+every second one with an equality filter). It speaks the judge's protocol,
+and like the judge it encodes each JSON request inside the timed loop: on
+this machine that encoding alone is 67 ms of the write phase and 20 ms of
+the query phase (with the requests encoded beforehand the phases take 134
+and 125 ms), a cost every submission carries. Each phase runs in its own
 transient systemd unit, so `memory.peak` is read from a real cgroup and
 includes page cache, as on the platform. This machine's user systemd has no
 io controller, so disk I/O comes from `/proc/<pid>/io` instead of
@@ -141,17 +145,19 @@ second read of the log). Recovery
 still decodes rows while it replays the log, since it reads them anyway, so
 a database reopened for queries starts with its cache ready.
 
-Median of five runs on an i5-9400F, NVMe ext4:
+Median of five runs on an i5-9400F, NVMe ext4, through the judge's protocol:
 
 | Phase | T | Peak memory | Disk I/O |
 |---|---|---|---|
-| write (100 commits) | 149 ms | 2.1 MiB | 5.45 MiB written |
-| query (1,000 TopK, uniform data) | 132 ms | 7.9 MiB | 5.06 MiB read |
+| write (100 commits) | 204 ms | 1.7 MiB | 5.45 MiB written |
+| query (1,000 TopK, uniform data) | 154 ms | 7.9 MiB | 5.06 MiB read |
+| write, in the image (`--docker --cpus 2`) | 221 ms | 4.6-5.1 MiB | 5.45 MiB written |
+| query, in the image | 232 ms | 8.1 MiB | 5.06 MiB read |
 
-Inside the container (`--docker`) `io.stat` reports the same bytes as
-`/proc/<pid>/io`, but times are higher: write about 179 ms, query 240-247 ms
-(462-552 ms before the vector codes). Each statement's round trip through
-Docker's stdio relay costs about 90 µs more (the `--floor` run is 136 ms
+Inside the container `io.stat` reports the same bytes as `/proc/<pid>/io`,
+but times are higher: each statement's round trip through
+Docker's stdio relay costs about 90 µs more (measured before the protocol
+change: a `--floor` run of 136 ms
 instead of 45 ms), which any submission measured this way pays too. The
 same binary also uses more CPU per query there, consistent with a native
 probe in which idle gaps between statements raise the cost of each query.
@@ -209,7 +215,9 @@ dictionary codes rather than strings while the column has at most 1,024
 distinct values.
 
 Query phase, median of five, recall 1.0 in every run (`MVDB_IVF=0` turns
-off the lists, `MVDB_SQ8=0` the codes):
+off the lists, `MVDB_SQ8=0` the codes). These were measured before the
+harness spoke the judge's protocol, so each lacks the roughly 20 ms of
+request encoding that the figures above include:
 
 | Data (10,000 x 128) | Neither | Lists | Codes | Both (default) |
 |---|---|---|---|---|
