@@ -12,6 +12,7 @@ use super::txn::{Changes, Txn};
 use super::Tables;
 use crate::error::DbResult;
 use crate::sql::ast::{Delete, Expr, Insert, Literal, Select, SelectItem, Update};
+use crate::storage::catalog::TableDef;
 use crate::storage::log::LogStore;
 use crate::types::Value;
 use crate::{bail, db_err};
@@ -158,12 +159,14 @@ pub(super) fn insert(tables: &Tables, txn: &mut Txn, ins: &Insert) -> DbResult<u
     Ok(ins.rows.len() as u64)
 }
 
-/// Returns the rows the WHERE clause matched and, of those, the rows whose
-/// values changed. Only the changed rows are written.
-pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update) -> DbResult<(u64, u64)> {
-    let id = tables.lookup(&up.table)?;
-    let table = tables.table(id)?;
-    let def = &table.def;
+/// A resolved UPDATE: the columns to set, each with its value, and the
+/// filter. Resolving it reports every error the statement can have.
+pub(super) struct UpdatePlan {
+    pub sets: Vec<(usize, Value)>,
+    filter: Option<CExpr>,
+}
+
+pub(super) fn plan_update(def: &TableDef, up: &Update) -> DbResult<UpdatePlan> {
     let mut sets = Vec::with_capacity(up.sets.len());
     for (name, expr) in &up.sets {
         let col = def.column(name).ok_or_else(|| db_err!(NoSuchColumn, "unknown column '{}'", name))?;
@@ -172,8 +175,47 @@ pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update
         }
         sets.push((col, literal_value(expr, &def.columns[col])?));
     }
-    let scope = Scope { def, alias: None };
-    let filter = compile_filter(up.filter.as_ref(), &scope)?;
+    let filter = compile_filter(up.filter.as_ref(), &Scope { def, alias: None })?;
+    Ok(UpdatePlan { sets, filter })
+}
+
+/// Whether storing `sets` would change the row.
+fn differs(row: &RowView<'_>, sets: &[(usize, Value)]) -> bool {
+    sets.iter().any(|(col, v)| match (row.get(*col), v) {
+        (ValRef::Int(a), Value::Int(b)) => a != *b,
+        (ValRef::Str(a), Value::Str(b)) => a != b,
+        (ValRef::Vector(a), Value::Vector(b)) => a != b.as_slice(),
+        _ => true,
+    })
+}
+
+/// For an UPDATE outside a transaction: the number of committed rows its
+/// WHERE clause matches and, in key order, the keys of those whose values
+/// it would change.
+pub(super) fn update_targets(log: &LogStore, table: &Table, plan: &UpdatePlan) -> DbResult<(u64, Vec<i64>)> {
+    let (mut matched, mut keys) = (0, Vec::new());
+    if let Some(range) = pk_range(plan.filter.as_ref(), table.def.pk) {
+        table.scan(log, range, |row| {
+            if plan.filter.as_ref().is_none_or(|f| f.test(&row)) {
+                matched += 1;
+                if differs(&row, &plan.sets) {
+                    keys.push(row.pk);
+                }
+            }
+            Ok(true)
+        })?;
+    }
+    Ok((matched, keys))
+}
+
+/// UPDATE inside a transaction. Returns the rows the WHERE clause matched
+/// and, of those, the rows whose values changed. Only the changed rows are
+/// written.
+pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update) -> DbResult<(u64, u64)> {
+    let id = tables.lookup(&up.table)?;
+    let table = tables.table(id)?;
+    let def = &table.def;
+    let UpdatePlan { sets, filter } = plan_update(def, up)?;
     let mut matched = Vec::new();
     if let Some(range) = pk_range(filter.as_ref(), def.pk) {
         scan_visible(table, log, txn.changes(id), range, &mut |row| {
@@ -201,20 +243,26 @@ pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update
     Ok((matched_rows, changed))
 }
 
-pub(super) fn delete(log: &LogStore, tables: &Tables, txn: &mut Txn, del: &Delete) -> DbResult<u64> {
-    let id = tables.lookup(&del.table)?;
-    let table = tables.table(id)?;
-    let scope = Scope { def: &table.def, alias: None };
-    let filter = compile_filter(del.filter.as_ref(), &scope)?;
+/// The keys of the rows a DELETE removes, in key order, among the rows
+/// visible with `changes` on top of the committed ones.
+pub(super) fn delete_targets(log: &LogStore, table: &Table, changes: Option<&Changes>, del: &Delete) -> DbResult<Vec<i64>> {
+    let filter = compile_filter(del.filter.as_ref(), &Scope { def: &table.def, alias: None })?;
     let mut doomed = Vec::new();
     if let Some(range) = pk_range(filter.as_ref(), table.def.pk) {
-        scan_visible(table, log, txn.changes(id), range, &mut |row| {
+        scan_visible(table, log, changes, range, &mut |row| {
             if filter.as_ref().is_none_or(|f| f.test(&row)) {
                 doomed.push(row.pk);
             }
             Ok(true)
         })?;
     }
+    Ok(doomed)
+}
+
+/// DELETE inside a transaction.
+pub(super) fn delete(log: &LogStore, tables: &Tables, txn: &mut Txn, del: &Delete) -> DbResult<u64> {
+    let id = tables.lookup(&del.table)?;
+    let doomed = delete_targets(log, tables.table(id)?, txn.changes(id), del)?;
     for &pk in &doomed {
         txn.write(id, pk, None);
     }

@@ -28,6 +28,7 @@ lines. A session from an empty directory is shown under [Protocol](#protocol).
 | Lexer and parser for the SQL subset | done, unit-tested |
 | Value types, vector literal validation (NaN/Inf/float32 overflow) | done |
 | Append-only commit log with torn-tail recovery | done, crash-tested |
+| UPDATE and DELETE larger than the memory limit (frames written and replayed in pieces) | done, unit-, differential-, crash- and memory-tested |
 | Executor: catalog, PK index, row cache, exact TopK, transactions | done, differential-tested |
 | AVX2/FMA distance prefilter (exact results), benchmark harness | done, measured |
 | Columnar row cache with filter pushdown | done, differential-tested, measured |
@@ -50,6 +51,9 @@ python3 tests/difftest.py --seeds 0:100 --steps 400            # results vs refe
 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash    # plus kill -9 and recovery
 MVDB_IVF_MIN_ROWS=1 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash   # vector index on every table
 MVDB_IVF_MIN_ROWS=1 MVDB_IVF_MAX_ROWS=30 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash   # tables crossing the list cap
+MVDB_CACHE_BYTES=3000 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash                 # rows read from the log
+MVDB_LOG_CHUNK=64 MVDB_BIG_FRAME=0 python3 tests/difftest.py --seeds 0:100 --steps 400 --crash    # frames written in pieces, replayed op by op
+python3 tests/mem_probe.py                                      # statements larger than the memory limit, in a 64 MiB cgroup
 python3 tests/public_cases.py                                   # the organizers' sample cases in mysqltest/
 ```
 
@@ -230,7 +234,9 @@ budget; default a quarter of the memory limit of the process's cgroup or of
 any group above it, read from `/proc/self/cgroup` and `/sys/fs/cgroup`),
 `MVDB_DROP_CACHE=0` (keep log pages in the page cache),
 `MVDB_DEFER_CACHE=0` (keep a table's rows in memory while it is only written
-to), `MVDB_IVF=0` and
+to), `MVDB_LOG_CHUNK` and `MVDB_BIG_FRAME` (bytes after which a frame is
+written in pieces, and replayed without being held in memory; the tests set
+them to 64 and 0), `MVDB_IVF=0` and
 `MVDB_SQ8=0` (leave out the lists or the codes), `MVDB_IVF_MIN_ROWS`
 (table size from which the index is used; the differential tests set it
 to 1) and `MVDB_IVF_MAX_ROWS` (largest table that gets lists).
@@ -274,6 +280,26 @@ the first torn frame, so a crash leaves each transaction fully applied or
 absent, and recovery itself can be interrupted and rerun safely. Written pages
 are dropped from the page cache after the sync, because page cache counts
 toward the container's measured memory.
+
+A frame larger than 1 MiB is written in pieces behind a header that is still
+zero, which recovery reads as a torn tail; the header is written last, then
+the frame is synced. Recovery checks the sum of a frame larger than 4 MiB in
+one pass and applies its operations in a second, without holding it in
+memory. With that, an UPDATE or DELETE outside a transaction needs a key and a
+location per row it changes (24 bytes) besides one buffer: it collects the
+keys, then reads, changes and writes one row at a time, and applies the
+change once the frame is durable. In a 64 MiB container, `UPDATE` of all
+100,000 rows of a 51 MiB table succeeds and is replayed by the next start
+(`tests/mem_probe.py`); before, the statement held every row about 4.6 times
+over and was killed.
+
+Known limits: an explicit transaction is held in memory until COMMIT: in
+the same 64 MiB container one that updates 50,000 rows (28 MiB) commits and
+one that updates 70,000 (39 MiB) is killed; the primary-key index takes
+about 55 bytes per row whatever the cache budget; ORDER BY on a column other
+than the primary key keeps every matching row's sort key; the log is never
+compacted, so overwritten and deleted rows stay on disk and are skipped by
+each start.
 
 ## SQL subset
 

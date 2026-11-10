@@ -9,7 +9,9 @@
 //!
 //! A frame is either completely valid after a crash or detected as torn by
 //! its length or checksum, so transactions are all-or-nothing without a
-//! separate undo log. Recovery replays valid frames in order and truncates
+//! separate undo log. A frame too large to buffer is written in pieces
+//! behind a header that is still zero and so reads as a torn tail; the
+//! header goes in last (`FrameWriter`). Recovery replays valid frames in order and truncates
 //! the active segment at the first invalid one; running it again on the
 //! truncated file finds the same frames, so an interrupted recovery is safe.
 //!
@@ -17,21 +19,29 @@
 //! appended to. Row locations handed out by `append` point straight at the
 //! row bytes inside a frame so point reads need one `pread`.
 
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read};
+use std::rc::Rc;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use super::catalog::TableDef;
 use super::codec::{self, Reader};
-use super::crc::crc32c;
+use super::crc::{crc32c, Crc32c};
 use crate::error::DbResult;
 use crate::{bail, db_err};
 
 const FRAME_HEADER: u64 = 8;
 const PAGE: u64 = 4096;
 const SCAN_BUFFER: usize = 256 << 10;
+/// A frame under construction is made durable and dropped from the page
+/// cache each time this much of it has been written, so that a very large
+/// frame builds up neither dirty pages nor cache.
+const SYNC_EVERY: u64 = 16 << 20;
+/// Largest buffer kept from one frame for the next.
+const SPARE_BYTES: usize = 4 << 20;
 
 const OP_CREATE_TABLE: u8 = 1;
 const OP_DROP_TABLE: u8 = 2;
@@ -76,11 +86,17 @@ pub struct LogOptions {
     /// Drop log pages from the page cache once they are durable or replayed.
     /// Off only to measure what dropping saves.
     pub drop_cache: bool,
+    /// Bytes of a frame under construction that are buffered before they
+    /// are written out. Only tests make it small.
+    pub chunk_bytes: usize,
+    /// Frames with a larger payload are replayed without being held in
+    /// memory whole. Only tests make it small.
+    pub big_frame_bytes: u64,
 }
 
 impl Default for LogOptions {
     fn default() -> Self {
-        LogOptions { segment_bytes: 64 << 20, sync: true, drop_cache: true }
+        LogOptions { segment_bytes: 64 << 20, sync: true, drop_cache: true, chunk_bytes: 1 << 20, big_frame_bytes: 4 << 20 }
     }
 }
 
@@ -95,10 +111,173 @@ pub struct LogStore {
     opts: LogOptions,
     /// Ordered by id; the last one is the active segment.
     segs: Vec<Segment>,
-    frame: Vec<u8>,
+    /// The last frame's buffer, kept for the next one.
+    spare: Cell<Vec<u8>>,
+    /// Set while a `FrameWriter` exists: there is one frame at a time.
+    writing: Rc<Cell<bool>>,
     next_lsn: u64,
     /// Active-segment offset below which the page cache has been dropped.
     dropped_upto: u64,
+}
+
+/// A transaction's frame while it is being written. Ops are added one at a
+/// time; once `chunk_bytes` of them are buffered they go to the file, behind
+/// a header that is still zero, so until `LogStore::end_frame` writes the
+/// header recovery takes whatever is there for a torn tail. A frame that
+/// never fills the buffer is written with a single `pwrite`, header
+/// included. A writer dropped without `end_frame` cuts off what it wrote.
+pub struct FrameWriter {
+    /// The active segment, through its own descriptor, so the log can still
+    /// be read while the frame is written.
+    file: File,
+    seg: u32,
+    /// Offset of the frame's header in the segment.
+    start: u64,
+    /// Bytes not written yet; while `headed`, after 8 bytes kept free for
+    /// the header.
+    buf: Vec<u8>,
+    headed: bool,
+    /// Payload bytes already in the file, and how many of them are synced.
+    flushed: u64,
+    synced: u64,
+    /// Checksum of the flushed payload.
+    crc: Crc32c,
+    ops_left: u64,
+    /// One encoded row.
+    row: Vec<u8>,
+    chunk_bytes: usize,
+    sync: bool,
+    drop_cache: bool,
+    finished: bool,
+    writing: Rc<Cell<bool>>,
+}
+
+impl FrameWriter {
+    fn payload_len(&self) -> u64 {
+        self.flushed + self.buf.len() as u64 - if self.headed { FRAME_HEADER } else { 0 }
+    }
+
+    /// Adds a row; `encode` appends its body to the buffer it is given.
+    /// Returns where the body will be once the frame is committed.
+    pub fn put(&mut self, table: u32, pk: i64, encode: impl FnOnce(&mut Vec<u8>) -> DbResult<()>) -> DbResult<RowLoc> {
+        self.begin_op()?;
+        self.row.clear();
+        encode(&mut self.row)?;
+        let len = u32::try_from(self.row.len()).map_err(|_| db_err!(Internal, "row of {} bytes is too large", self.row.len()))?;
+        self.buf.push(OP_PUT);
+        codec::put_u32(&mut self.buf, table);
+        codec::put_i64(&mut self.buf, pk);
+        codec::put_varint(&mut self.buf, len as u64);
+        let loc = RowLoc { seg: self.seg, off: self.start + FRAME_HEADER + self.payload_len(), len };
+        self.buf.extend_from_slice(&self.row);
+        self.end_op()?;
+        Ok(loc)
+    }
+
+    pub fn delete(&mut self, table: u32, pk: i64) -> DbResult<()> {
+        self.begin_op()?;
+        self.buf.push(OP_DELETE);
+        codec::put_u32(&mut self.buf, table);
+        codec::put_i64(&mut self.buf, pk);
+        self.end_op()
+    }
+
+    /// Adds a catalog change.
+    fn ddl(&mut self, op: &Op) -> DbResult<()> {
+        self.begin_op()?;
+        match op {
+            Op::CreateTable(def) => {
+                self.buf.push(OP_CREATE_TABLE);
+                def.encode(&mut self.buf);
+            }
+            Op::DropTable { table } => {
+                self.buf.push(OP_DROP_TABLE);
+                codec::put_u32(&mut self.buf, *table);
+            }
+            Op::CreateIndex { table, name } => {
+                self.buf.push(OP_CREATE_INDEX);
+                codec::put_u32(&mut self.buf, *table);
+                codec::put_str(&mut self.buf, name);
+            }
+            Op::Put { .. } | Op::Delete { .. } => bail!(Internal, "not a catalog change"),
+        }
+        self.end_op()
+    }
+
+    fn begin_op(&mut self) -> DbResult<()> {
+        if self.ops_left == 0 {
+            bail!(Internal, "more operations than the frame was opened for");
+        }
+        self.ops_left -= 1;
+        Ok(())
+    }
+
+    fn end_op(&mut self) -> DbResult<()> {
+        if self.payload_len() > u32::MAX as u64 {
+            bail!(Internal, "transaction of {} bytes is too large", self.payload_len());
+        }
+        if self.buf.len() >= self.chunk_bytes {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the buffered payload to its place behind the header.
+    fn flush(&mut self) -> io::Result<()> {
+        let body = &self.buf[if self.headed { FRAME_HEADER as usize } else { 0 }..];
+        self.crc.update(body);
+        self.file.write_all_at(body, self.start + FRAME_HEADER + self.flushed)?;
+        self.flushed += body.len() as u64;
+        self.buf.clear();
+        self.headed = false;
+        if self.flushed - self.synced >= SYNC_EVERY {
+            if self.sync {
+                self.file.sync_data()?;
+            }
+            // Whole pages of what is now durable; never the page that holds
+            // the header, which is still to be written.
+            let from = (self.start + FRAME_HEADER + self.synced).next_multiple_of(PAGE);
+            let upto = (self.start + FRAME_HEADER + self.flushed) & !(PAGE - 1);
+            if self.drop_cache && upto > from {
+                drop_cache(&self.file, from, upto - from);
+            }
+            self.synced = self.flushed;
+        }
+        Ok(())
+    }
+
+    /// Writes what is left and then the header, and makes the frame durable.
+    fn finish(&mut self) -> io::Result<()> {
+        let len = (self.payload_len() as u32).to_le_bytes();
+        if self.headed {
+            let crc = crc32c(&self.buf[FRAME_HEADER as usize..]);
+            self.buf[0..4].copy_from_slice(&len);
+            self.buf[4..8].copy_from_slice(&crc.to_le_bytes());
+            self.file.write_all_at(&self.buf, self.start)?;
+        } else {
+            self.flush()?;
+            let mut header = [0u8; FRAME_HEADER as usize];
+            header[0..4].copy_from_slice(&len);
+            header[4..8].copy_from_slice(&self.crc.finish().to_le_bytes());
+            self.file.write_all_at(&header, self.start)?;
+        }
+        if self.sync {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FrameWriter {
+    fn drop(&mut self) {
+        // Given up after part of it reached the file: cut that part off, so
+        // the next frame does not land behind garbage. Nothing can have been
+        // appended after it, since there is one writer at a time.
+        if !self.finished && !self.headed {
+            let _ = self.file.set_len(self.start);
+        }
+        self.writing.set(false);
+    }
 }
 
 impl LogStore {
@@ -117,7 +296,7 @@ impl LogStore {
         for (i, &id) in ids.iter().enumerate() {
             let file = OpenOptions::new().read(true).write(true).open(segment_path(dir, id))?;
             let file_len = file.metadata()?.len();
-            let end = scan_segment(&file, id, file_len, opts.drop_cache, &mut payload, |lsn, ops| {
+            let end = scan_segment(&file, id, file_len, &opts, &mut payload, |lsn, ops| {
                 last_lsn = lsn;
                 apply(lsn, ops)
             })?;
@@ -138,7 +317,8 @@ impl LogStore {
             dir: dir.to_path_buf(),
             opts,
             segs,
-            frame: Vec::new(),
+            spare: Cell::new(Vec::new()),
+            writing: Rc::new(Cell::new(false)),
             next_lsn: last_lsn + 1,
             dropped_upto: 0,
         };
@@ -152,21 +332,72 @@ impl LogStore {
     /// Durably appends one transaction. Returns the location of each `Put`
     /// row body, in op order. On error nothing is appended.
     pub fn append(&mut self, ops: &[Op]) -> DbResult<Vec<RowLoc>> {
-        let mut row_offsets = Vec::new();
-        encode_frame(&mut self.frame, self.next_lsn, ops, &mut row_offsets)?;
-        let sync = self.opts.sync;
+        let mut frame = self.begin_frame(ops.len() as u64)?;
+        let mut locs = Vec::new();
+        for op in ops {
+            match op {
+                Op::Put { table, pk, row } => locs.push(frame.put(*table, *pk, |buf| {
+                    buf.extend_from_slice(row);
+                    Ok(())
+                })?),
+                Op::Delete { table, pk } => frame.delete(*table, *pk)?,
+                catalog => frame.ddl(catalog)?,
+            }
+        }
+        self.end_frame(frame)?;
+        Ok(locs)
+    }
+
+    /// Starts the frame of one transaction with `ops` operations. They are
+    /// added to the writer, which `end_frame` then commits; until then, and
+    /// if the writer is dropped instead, the log is unchanged.
+    pub fn begin_frame(&self, ops: u64) -> DbResult<FrameWriter> {
+        if self.writing.replace(true) {
+            bail!(Internal, "a log frame is already being written");
+        }
+        let seg = self.segs.last().expect("log always has an active segment");
+        let mut buf = self.spare.take();
+        buf.clear();
+        buf.extend_from_slice(&[0u8; FRAME_HEADER as usize]);
+        codec::put_u64(&mut buf, self.next_lsn);
+        codec::put_varint(&mut buf, ops);
+        Ok(FrameWriter {
+            file: seg.file.try_clone().inspect_err(|_| self.writing.set(false))?,
+            seg: seg.id,
+            start: seg.len,
+            buf,
+            headed: true,
+            flushed: 0,
+            synced: 0,
+            crc: Crc32c::new(),
+            ops_left: ops,
+            row: Vec::new(),
+            chunk_bytes: self.opts.chunk_bytes,
+            sync: self.opts.sync,
+            drop_cache: self.opts.drop_cache,
+            finished: false,
+            writing: Rc::clone(&self.writing),
+        })
+    }
+
+    /// Commits a frame: once this returns the transaction is durable. On
+    /// error nothing of it is left in the log.
+    pub fn end_frame(&mut self, mut frame: FrameWriter) -> DbResult<()> {
         let seg = self.segs.last_mut().expect("log always has an active segment");
-        let start = seg.len;
-        if let Err(e) = write_frame(&seg.file, &self.frame, start, sync) {
+        if frame.ops_left != 0 || frame.seg != seg.id || frame.start != seg.len {
+            bail!(Internal, "log frame does not match the log: {} operations missing", frame.ops_left);
+        }
+        if let Err(e) = frame.finish() {
             // Cut off whatever part of the frame reached the file so the next
             // frame does not land behind garbage.
-            let _ = seg.file.set_len(start);
+            let _ = seg.file.set_len(frame.start);
+            frame.finished = true;
             return Err(e.into());
         }
-        seg.len = start + self.frame.len() as u64;
+        frame.finished = true;
+        seg.len = frame.start + FRAME_HEADER + frame.payload_len();
         self.next_lsn += 1;
         let seg_id = seg.id;
-        let locs = row_offsets.iter().map(|&(off, len)| RowLoc { seg: seg_id, off: start + off, len }).collect();
 
         // The written pages are durable and will be read back only through
         // our own caches, so drop them from the page cache (it counts toward
@@ -184,7 +415,11 @@ impl LogStore {
                 eprintln!("log: cannot start segment {}: {e}; segment {seg_id} stays active", seg_id + 1);
             }
         }
-        Ok(locs)
+        let buf = std::mem::take(&mut frame.buf);
+        if buf.capacity() <= SPARE_BYTES {
+            self.spare.set(buf);
+        }
+        Ok(())
     }
 
     /// Reads a row body previously returned by `append` or replay.
@@ -204,7 +439,7 @@ impl LogStore {
     pub fn scan(&self, mut f: impl FnMut(u64, &[OpView<'_>]) -> DbResult<()>) -> DbResult<()> {
         let mut payload = Vec::new();
         for seg in &self.segs {
-            let end = scan_segment(&seg.file, seg.id, seg.len, self.opts.drop_cache, &mut payload, &mut f)?;
+            let end = scan_segment(&seg.file, seg.id, seg.len, &self.opts, &mut payload, &mut f)?;
             if end != seg.len {
                 bail!(Corrupt, "segment {} changed under a scan", seg.id);
             }
@@ -262,60 +497,6 @@ fn list_segments(dir: &Path) -> DbResult<Vec<u32>> {
     Ok(ids)
 }
 
-fn write_frame(file: &File, frame: &[u8], at: u64, sync: bool) -> io::Result<()> {
-    file.write_all_at(frame, at)?;
-    if sync {
-        file.sync_data()?;
-    }
-    Ok(())
-}
-
-/// Encodes `ops` as one frame into `buf`, recording `(offset, len)` of every
-/// `Put` row body relative to the frame start.
-fn encode_frame(buf: &mut Vec<u8>, lsn: u64, ops: &[Op], row_offsets: &mut Vec<(u64, u32)>) -> DbResult<()> {
-    buf.clear();
-    buf.extend_from_slice(&[0u8; FRAME_HEADER as usize]);
-    codec::put_u64(buf, lsn);
-    codec::put_varint(buf, ops.len() as u64);
-    for op in ops {
-        match op {
-            Op::CreateTable(def) => {
-                buf.push(OP_CREATE_TABLE);
-                def.encode(buf);
-            }
-            Op::DropTable { table } => {
-                buf.push(OP_DROP_TABLE);
-                codec::put_u32(buf, *table);
-            }
-            Op::CreateIndex { table, name } => {
-                buf.push(OP_CREATE_INDEX);
-                codec::put_u32(buf, *table);
-                codec::put_str(buf, name);
-            }
-            Op::Put { table, pk, row } => {
-                let len = u32::try_from(row.len()).map_err(|_| db_err!(Internal, "row of {} bytes is too large", row.len()))?;
-                buf.push(OP_PUT);
-                codec::put_u32(buf, *table);
-                codec::put_i64(buf, *pk);
-                codec::put_varint(buf, row.len() as u64);
-                row_offsets.push((buf.len() as u64, len));
-                buf.extend_from_slice(row);
-            }
-            Op::Delete { table, pk } => {
-                buf.push(OP_DELETE);
-                codec::put_u32(buf, *table);
-                codec::put_i64(buf, *pk);
-            }
-        }
-    }
-    let payload_len = buf.len() - FRAME_HEADER as usize;
-    let len = u32::try_from(payload_len).map_err(|_| db_err!(Internal, "transaction of {} bytes is too large", payload_len))?;
-    let crc = crc32c(&buf[FRAME_HEADER as usize..]);
-    buf[0..4].copy_from_slice(&len.to_le_bytes());
-    buf[4..8].copy_from_slice(&crc.to_le_bytes());
-    Ok(())
-}
-
 /// `payload` holds one frame's payload starting at file offset `base`.
 fn decode_frame(payload: &[u8], seg: u32, base: u64) -> DbResult<(u64, Vec<OpView<'_>>)> {
     let mut r = Reader::new(payload);
@@ -349,15 +530,16 @@ fn decode_frame(payload: &[u8], seg: u32, base: u64) -> DbResult<(u64, Vec<OpVie
 /// Replays frames from the start of `file` up to `limit` bytes and returns
 /// the offset just past the last valid frame. A frame that is cut short or
 /// fails its checksum ends the scan; a frame that checks out but does not
-/// decode is real corruption and is an error.
+/// decode is real corruption and is an error. `payload` is scratch space.
 fn scan_segment(
     file: &File,
     seg: u32,
     limit: u64,
-    drop_behind: bool,
+    opts: &LogOptions,
     payload: &mut Vec<u8>,
     mut f: impl FnMut(u64, &[OpView<'_>]) -> DbResult<()>,
 ) -> DbResult<u64> {
+    let drop_behind = opts.drop_cache;
     let mut reader = BufReader::with_capacity(SCAN_BUFFER, PosReader { file, pos: 0, drop_behind, dropped: 0 });
     let mut off = 0u64;
     while off + FRAME_HEADER <= limit {
@@ -368,16 +550,126 @@ fn scan_segment(
         if len == 0 || off + FRAME_HEADER + len > limit {
             break;
         }
-        payload.resize(len as usize, 0);
-        reader.read_exact(payload)?;
-        if crc32c(payload) != crc {
-            break;
+        let base = off + FRAME_HEADER;
+        if len > opts.big_frame_bytes && holds_rows(file, base) {
+            // Too large to hold: one pass for the checksum, and only if it
+            // is right a second one that hands the ops on as they are read.
+            let mut sum = Crc32c::new();
+            payload.resize(64 << 10, 0);
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(payload.len() as u64) as usize;
+                reader.read_exact(&mut payload[..n])?;
+                sum.update(&payload[..n]);
+                left -= n as u64;
+            }
+            if sum.finish() != crc {
+                break;
+            }
+            replay_large_frame(file, seg, base, len, drop_behind, payload, &mut f)?;
+        } else {
+            payload.resize(len as usize, 0);
+            reader.read_exact(payload)?;
+            if crc32c(payload) != crc {
+                break;
+            }
+            let (lsn, ops) = decode_frame(payload, seg, base)?;
+            f(lsn, &ops)?;
         }
-        let (lsn, ops) = decode_frame(payload, seg, off + FRAME_HEADER)?;
-        f(lsn, &ops)?;
         off += FRAME_HEADER + len;
     }
     Ok(off)
+}
+
+/// Whether the frame whose payload starts at `base` begins with a row
+/// operation. Only such frames are ever large; a catalog change is a small
+/// frame of its own. Anything unreadable is left to the ordinary path.
+fn holds_rows(file: &File, base: u64) -> bool {
+    let mut head = [0u8; 32];
+    let n = file.read_at(&mut head, base).unwrap_or(0);
+    let mut r = Reader::new(&head[..n]);
+    r.u64().and_then(|_| r.varint()).and_then(|_| r.u8()).is_ok_and(|tag| tag == OP_PUT || tag == OP_DELETE)
+}
+
+/// Replays a frame of row operations whose checksum has been verified,
+/// reading it again from `base` and handing each op on as soon as it is
+/// read, so memory does not grow with the frame. `row` is scratch space.
+fn replay_large_frame(
+    file: &File,
+    seg: u32,
+    base: u64,
+    len: u64,
+    drop_behind: bool,
+    row: &mut Vec<u8>,
+    f: &mut impl FnMut(u64, &[OpView<'_>]) -> DbResult<()>,
+) -> DbResult<()> {
+    let source = PosReader { file, pos: base, drop_behind, dropped: base & !(PAGE - 1) };
+    let mut r = FrameReader { src: BufReader::with_capacity(SCAN_BUFFER, source).take(len), pos: 0 };
+    let lsn = u64::from_le_bytes(r.array()?);
+    let ops = r.varint()?;
+    for _ in 0..ops {
+        match r.array::<1>()?[0] {
+            OP_PUT => {
+                let table = u32::from_le_bytes(r.array()?);
+                let pk = i64::from_le_bytes(r.array()?);
+                let row_len = r.varint()?;
+                let at = r.pos;
+                if row_len > len - at {
+                    bail!(Corrupt, "row of {} bytes runs past the end of log frame {}", row_len, lsn);
+                }
+                row.resize(row_len as usize, 0);
+                r.fill(row)?;
+                let loc = RowLoc { seg, off: base + at, len: row_len as u32 };
+                f(lsn, &[OpView::Put { table, pk, row, loc }])?;
+            }
+            OP_DELETE => {
+                let table = u32::from_le_bytes(r.array()?);
+                let pk = i64::from_le_bytes(r.array()?);
+                f(lsn, &[OpView::Delete { table, pk }])?;
+            }
+            t => bail!(Corrupt, "unexpected log op {} in large frame {}", t, lsn),
+        }
+    }
+    if r.pos != len {
+        bail!(Corrupt, "{} trailing bytes in log frame {}", len - r.pos, lsn);
+    }
+    Ok(())
+}
+
+/// Reads a frame's payload piece by piece and counts the bytes read. A
+/// payload that ends early is corruption: its checksum was right.
+struct FrameReader<R: Read> {
+    src: R,
+    pos: u64,
+}
+
+impl<R: Read> FrameReader<R> {
+    fn fill(&mut self, out: &mut [u8]) -> DbResult<()> {
+        self.src.read_exact(out).map_err(|e| match e.kind() {
+            io::ErrorKind::UnexpectedEof => db_err!(Corrupt, "log frame ends inside an operation"),
+            _ => e.into(),
+        })?;
+        self.pos += out.len() as u64;
+        Ok(())
+    }
+
+    fn array<const N: usize>(&mut self) -> DbResult<[u8; N]> {
+        let mut a = [0u8; N];
+        self.fill(&mut a)?;
+        Ok(a)
+    }
+
+    fn varint(&mut self) -> DbResult<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = self.array::<1>()?[0];
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Ok(v);
+            }
+        }
+        bail!(Corrupt, "varint too long")
+    }
 }
 
 /// `Read` over a shared `File` using positional reads, so scans never move
@@ -447,7 +739,7 @@ mod tests {
     }
 
     fn opts() -> LogOptions {
-        LogOptions { segment_bytes: 64 << 20, sync: false, drop_cache: true }
+        LogOptions { sync: false, ..LogOptions::default() }
     }
 
     fn table() -> TableDef {
@@ -575,7 +867,7 @@ mod tests {
     #[test]
     fn segments_roll_over() {
         let dir = TempDir::new();
-        let o = LogOptions { segment_bytes: 200, sync: false, drop_cache: true };
+        let o = LogOptions { segment_bytes: 200, ..opts() };
         let (mut log, _) = replay(&dir.0, o.clone());
         let mut locs = Vec::new();
         for pk in 0..20 {
@@ -606,7 +898,7 @@ mod tests {
     fn failed_rollover_keeps_the_commit() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new();
-        let o = LogOptions { segment_bytes: 100, sync: true, drop_cache: true };
+        let o = LogOptions { segment_bytes: 100, sync: true, ..opts() };
         let (mut log, _) = replay(&dir.0, o.clone());
         let mode = |m: u32| fs::set_permissions(&dir.0, fs::Permissions::from_mode(m)).unwrap();
         mode(0o555);
@@ -650,7 +942,7 @@ mod tests {
     #[test]
     fn damaged_older_segment_is_an_error() {
         let dir = TempDir::new();
-        let o = LogOptions { segment_bytes: 100, sync: false, drop_cache: true };
+        let o = LogOptions { segment_bytes: 100, ..opts() };
         let (mut log, _) = replay(&dir.0, o.clone());
         for pk in 0..6 {
             log.append(&[put(pk, 1, 60)]).unwrap();
@@ -663,5 +955,169 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         let err = LogStore::open(&dir.0, o, |_, _| Ok(())).err().unwrap();
         assert_eq!(err.kind, crate::error::ErrorKind::Corrupt);
+    }
+
+    /// A mixed log: catalog changes in frames of their own, then
+    /// transactions of rows and deletes.
+    fn mixed(log: &mut LogStore) {
+        log.append(&[Op::CreateTable(table())]).unwrap();
+        log.append(&[put(1, 1, 30), put(2, 2, 300), Op::Delete { table: 7, pk: 9 }, put(3, 3, 1)]).unwrap();
+        log.append(&[Op::CreateIndex { table: 7, name: "ix".into() }]).unwrap();
+        log.append(&[Op::Delete { table: 7, pk: 1 }]).unwrap();
+        log.append(&(10..40).map(|pk| put(pk, pk as u8, 20 + pk as usize)).collect::<Vec<_>>()).unwrap();
+        log.append(&[put(2, 9, 0)]).unwrap();
+    }
+
+    /// A frame written in pieces is byte for byte the frame written at once.
+    #[test]
+    fn streamed_frames_are_byte_identical() {
+        let (whole, pieces) = (TempDir::new(), TempDir::new());
+        mixed(&mut replay(&whole.0, opts()).0);
+        for chunk_bytes in [1, 64, 1000] {
+            let _ = fs::remove_dir_all(&pieces.0);
+            mixed(&mut replay(&pieces.0, LogOptions { chunk_bytes, ..opts() }).0);
+            assert_eq!(fs::read(segment_path(&pieces.0, 1)).unwrap(), fs::read(segment_path(&whole.0, 1)).unwrap(), "chunks of {chunk_bytes}");
+        }
+    }
+
+    /// Row locations handed out while a frame is written in pieces point at
+    /// the rows once it is committed.
+    #[test]
+    fn streamed_frame_locations() {
+        let dir = TempDir::new();
+        let (mut log, _) = replay(&dir.0, LogOptions { chunk_bytes: 50, ..opts() });
+        log.append(&[put(0, 7, 5)]).unwrap();
+        let mut frame = log.begin_frame(41).unwrap();
+        let mut locs = Vec::new();
+        for pk in 0..40i64 {
+            locs.push(frame.put(7, pk, |buf| {
+                buf.extend(std::iter::repeat_n(pk as u8, 10 + pk as usize));
+                Ok(())
+            })
+            .unwrap());
+        }
+        frame.delete(7, 99).unwrap();
+        log.end_frame(frame).unwrap();
+        let mut buf = Vec::new();
+        for (pk, loc) in locs.iter().enumerate() {
+            log.read(*loc, &mut buf).unwrap();
+            assert_eq!(buf, vec![pk as u8; 10 + pk], "row {pk}");
+        }
+        drop(log);
+        let (_, seen) = replay(&dir.0, opts());
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].1.len(), 41);
+        assert_eq!(seen[1].1[3], Seen::Put(7, 3, vec![3; 13], locs[3]));
+    }
+
+    /// Cut the log at every byte offset inside a frame that was written in
+    /// pieces, header last.
+    #[test]
+    fn torn_streamed_frame_at_every_offset() {
+        let dir = TempDir::new();
+        let o = LogOptions { chunk_bytes: 64, ..opts() };
+        let (mut log, _) = replay(&dir.0, o.clone());
+        log.append(&[put(1, 1, 10)]).unwrap();
+        let good = log.size();
+        log.append(&(2..12).map(|pk| put(pk, pk as u8, 40)).collect::<Vec<_>>()).unwrap();
+        let full = log.size();
+        drop(log);
+        let path = segment_path(&dir.0, 1);
+        let bytes = fs::read(&path).unwrap();
+        for cut in good..full {
+            fs::write(&path, &bytes[..cut as usize]).unwrap();
+            let (log, seen) = replay(&dir.0, o.clone());
+            assert_eq!(seen.len(), 1, "cut at {cut}");
+            assert_eq!(log.size(), good);
+        }
+    }
+
+    /// The state a crash leaves between the last piece and the header: the
+    /// payload is all there, the header is still zero.
+    #[test]
+    fn frame_without_its_header_is_discarded() {
+        let dir = TempDir::new();
+        let o = LogOptions { chunk_bytes: 64, ..opts() };
+        let (mut log, _) = replay(&dir.0, o.clone());
+        log.append(&[put(1, 1, 10)]).unwrap();
+        let good = log.size();
+        log.append(&(2..12).map(|pk| put(pk, pk as u8, 40)).collect::<Vec<_>>()).unwrap();
+        drop(log);
+        let path = segment_path(&dir.0, 1);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[good as usize..good as usize + FRAME_HEADER as usize].fill(0);
+        fs::write(&path, &bytes).unwrap();
+        let (mut log, seen) = replay(&dir.0, o.clone());
+        assert_eq!(seen.len(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), good);
+        log.append(&[put(50, 5, 16)]).unwrap();
+        drop(log);
+        let (_, seen) = replay(&dir.0, o);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].0, 2, "lsn continues after the last valid frame");
+    }
+
+    /// A writer that is dropped leaves the log as it was, also after pieces
+    /// of its frame reached the file, and the next frame starts cleanly.
+    #[test]
+    fn abandoned_frame_leaves_no_trace() {
+        let dir = TempDir::new();
+        let o = LogOptions { chunk_bytes: 64, ..opts() };
+        let (mut log, _) = replay(&dir.0, o.clone());
+        log.append(&[put(1, 1, 10)]).unwrap();
+        let good = log.size();
+        let path = segment_path(&dir.0, 1);
+        let mut frame = log.begin_frame(100).unwrap();
+        assert!(log.begin_frame(1).is_err(), "one frame at a time");
+        for pk in 0..20 {
+            frame.put(7, pk, |buf| {
+                buf.extend_from_slice(&[9; 50]);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(fs::metadata(&path).unwrap().len() > good, "pieces were written");
+        // Ending it with operations missing fails and cuts it off as well.
+        assert!(log.end_frame(frame).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), good);
+        let frame = log.begin_frame(1).unwrap();
+        drop(frame);
+        assert_eq!(log.size(), good);
+        log.append(&[put(2, 2, 10)]).unwrap();
+        drop(log);
+        let (_, seen) = replay(&dir.0, o);
+        assert_eq!(seen.iter().map(|(lsn, ops)| (*lsn, ops.len())).collect::<Vec<_>>(), [(1, 1), (2, 1)]);
+    }
+
+    /// Replaying row frames op by op gives what replaying them whole gives,
+    /// through torn and corrupt tails too.
+    #[test]
+    fn large_frames_replay_like_small_ones() {
+        let dir = TempDir::new();
+        mixed(&mut replay(&dir.0, opts()).0);
+        let (_, whole) = replay(&dir.0, opts());
+        let streamed = LogOptions { big_frame_bytes: 0, ..opts() };
+        let (_, pieces) = replay(&dir.0, streamed.clone());
+        // Op by op, a frame arrives as one call per op under the same lsn.
+        let flat = |seen: &[(u64, Vec<Seen>)]| -> Vec<(u64, String)> {
+            seen.iter().flat_map(|(lsn, ops)| ops.iter().map(|op| (*lsn, format!("{op:?}")))).collect()
+        };
+        assert_eq!(flat(&pieces), flat(&whole));
+        assert!(pieces.len() > whole.len(), "row frames were replayed op by op");
+
+        let path = segment_path(&dir.0, 1);
+        let bytes = fs::read(&path).unwrap();
+        let ops_whole = flat(&whole).len();
+        // Corrupt the last frame: both ways stop before it.
+        let mut bad = bytes.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        fs::write(&path, &bad).unwrap();
+        let (_, a) = replay(&dir.0, streamed.clone());
+        assert_eq!(flat(&a).len(), ops_whole - 1);
+        // Cut inside the large frame of thirty rows: it is dropped whole.
+        fs::write(&path, &bytes[..bytes.len() - 100]).unwrap();
+        let (_, b) = replay(&dir.0, streamed);
+        assert_eq!(flat(&b).len(), ops_whole - 31);
     }
 }

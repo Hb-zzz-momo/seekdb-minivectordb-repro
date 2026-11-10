@@ -1,10 +1,11 @@
 //! Statement execution on top of the commit log: catalog, transactions,
 //! DDL and DML.
 //!
-//! Every statement writes into the transaction overlay (`txn`). Outside
-//! BEGIN ... COMMIT the overlay is committed right after the statement. A
-//! commit turns the overlay into one log frame, then applies it to the
-//! in-memory tables. DDL implicitly commits an open transaction; BEGIN inside
+//! Inside BEGIN ... COMMIT every statement writes into the transaction
+//! overlay (`txn`), and COMMIT turns the overlay into one log frame, then
+//! applies it to the in-memory tables. Outside a transaction an INSERT does
+//! the same for itself, while UPDATE and DELETE write their frame directly,
+//! so that the memory they need does not grow with the rows they touch. DDL implicitly commits an open transaction; BEGIN inside
 //! one is an error (`Semantics`).
 
 pub mod expr;
@@ -21,11 +22,11 @@ use std::path::Path;
 
 use crate::cgroup;
 use crate::error::DbResult;
-use crate::sql::ast::{CreateTable, Statement};
+use crate::sql::ast::{CreateTable, Delete, Statement, Update};
 use crate::storage::catalog::{Column, TableDef};
-use crate::storage::log::{LogOptions, LogStore, Op, OpView};
+use crate::storage::log::{LogOptions, LogStore, Op, OpView, RowLoc};
 use crate::storage::row::{decode_row, encode_row};
-use crate::types::DataType;
+use crate::types::{DataType, Value};
 use crate::{bail, db_err};
 use result::{Collect, ExecResult, Outcome, RowSink};
 use table::Table;
@@ -99,10 +100,19 @@ pub struct IndexOptions {
 
 impl Default for EngineOptions {
     fn default() -> Self {
-        // MVDB_DROP_CACHE=0 is for benchmarks only.
+        // MVDB_DROP_CACHE=0 is for benchmarks only; MVDB_LOG_CHUNK and
+        // MVDB_BIG_FRAME let tests write frames in pieces and replay them op
+        // by op on small data.
         let drop_cache = std::env::var("MVDB_DROP_CACHE").map_or(true, |v| v != "0");
+        let num = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+        let log = LogOptions::default();
         EngineOptions {
-            log: LogOptions { drop_cache, ..LogOptions::default() },
+            log: LogOptions {
+                drop_cache,
+                chunk_bytes: num("MVDB_LOG_CHUNK").map_or(log.chunk_bytes, |n| n as usize),
+                big_frame_bytes: num("MVDB_BIG_FRAME").unwrap_or(log.big_frame_bytes),
+                ..log
+            },
             cache_budget: default_cache_budget(),
             index: default_index_options(),
             semantics: Semantics::from_env(),
@@ -228,6 +238,14 @@ impl Tables {
     }
 }
 
+/// A committed change that is applied to its table once the frame holding
+/// it is durable.
+enum Applied {
+    /// A row at its new location, with its values if the table caches them.
+    Put(RowLoc, Option<Vec<Value>>),
+    Delete,
+}
+
 pub struct Engine {
     log: LogStore,
     tables: Tables,
@@ -325,6 +343,13 @@ impl Engine {
                     Statement::Delete(s) => self.prepare_read(&s.table)?,
                     _ => {}
                 }
+                if !self.txn.explicit {
+                    match stmt {
+                        Statement::Update(s) => return self.update_autocommit(s).map(Outcome::Affected),
+                        Statement::Delete(s) => return self.delete_autocommit(s).map(Outcome::Affected),
+                        _ => {}
+                    }
+                }
                 self.txn.begin_statement();
                 let count_matched = self.semantics.update_counts_matched;
                 let r = match stmt {
@@ -392,42 +417,102 @@ impl Engine {
     /// them. On error the changes are discarded.
     fn commit(&mut self) -> DbResult<()> {
         let changes = self.txn.take_changes();
-        let mut ops = Vec::new();
+        let mut ops = 0u64;
         for (&id, rows) in &changes {
             let table = self.tables.table(id)?;
-            for (&pk, row) in rows {
+            ops += rows.iter().filter(|(pk, row)| row.is_some() || table.rows.contains_key(pk)).count() as u64;
+        }
+        if ops == 0 {
+            return Ok(());
+        }
+        // Rows are encoded straight into the frame; what has to wait for the
+        // frame to be durable is kept in `applied`.
+        let mut frame = self.log.begin_frame(ops)?;
+        let mut applied: Vec<(u32, i64, Applied)> = Vec::with_capacity(ops as usize);
+        for (id, rows) in changes {
+            let table = self.tables.table(id)?;
+            // The table has a cache and will not have it set aside below.
+            let keep = table.is_cached() && (table.read || !self.defer_cache);
+            for (pk, row) in rows {
                 match row {
                     Some(values) => {
-                        let mut buf = Vec::new();
-                        encode_row(&table.def, values, &mut buf)?;
-                        ops.push(Op::Put { table: id, pk, row: buf });
+                        let loc = frame.put(id, pk, |buf| encode_row(&table.def, &values, buf))?;
+                        applied.push((id, pk, Applied::Put(loc, keep.then_some(values))));
                     }
-                    None if table.rows.contains_key(&pk) => ops.push(Op::Delete { table: id, pk }),
+                    None if table.rows.contains_key(&pk) => {
+                        frame.delete(id, pk)?;
+                        applied.push((id, pk, Applied::Delete));
+                    }
                     None => {}
                 }
             }
         }
-        if ops.is_empty() {
-            return Ok(());
-        }
-        let mut locs = self.log.append(&ops)?.into_iter();
-        for (id, rows) in changes {
+        self.log.end_frame(frame)?;
+        for (id, pk, change) in applied {
             let Some(table) = self.tables.by_id.get_mut(&id) else { continue };
             if !table.read && self.defer_cache {
                 table.defer_cache();
             }
-            for (pk, row) in rows {
-                match row {
-                    Some(values) => match locs.next() {
-                        Some(loc) => table.apply_put(pk, loc, Some(values)),
-                        None => bail!(Internal, "commit lost track of row locations"),
-                    },
-                    None => table.apply_delete(pk),
-                }
+            match change {
+                Applied::Put(loc, values) => table.apply_put(pk, loc, values),
+                Applied::Delete => table.apply_delete(pk),
             }
         }
         self.tables.enforce_budget();
         Ok(())
+    }
+
+    /// UPDATE outside a transaction. The keys of the rows to change are
+    /// collected first; each row is then read, changed and encoded straight
+    /// into the log frame, and applied once the frame is durable. Besides one
+    /// buffer of the frame, that takes a key and a location per row, so a
+    /// statement may change more data than fits in memory. An error on the
+    /// way drops the frame, and the statement has changed nothing.
+    fn update_autocommit(&mut self, up: &Update) -> DbResult<u64> {
+        let id = self.tables.lookup(&up.table)?;
+        let table = self.tables.table(id)?;
+        let plan = query::plan_update(&table.def, up)?;
+        let (matched, keys) = query::update_targets(&self.log, table, &plan)?;
+        if !keys.is_empty() {
+            let mut frame = self.log.begin_frame(keys.len() as u64)?;
+            let mut locs = Vec::with_capacity(keys.len());
+            for &pk in &keys {
+                let mut values = table.get(&self.log, pk)?.ok_or_else(|| db_err!(Internal, "row {} vanished during an update", pk))?;
+                for (col, v) in &plan.sets {
+                    values[*col] = v.clone();
+                }
+                locs.push(frame.put(id, pk, |buf| encode_row(&table.def, &values, buf))?);
+            }
+            self.log.end_frame(frame)?;
+            if let Some(table) = self.tables.by_id.get_mut(&id) {
+                for (&pk, loc) in keys.iter().zip(locs) {
+                    table.apply_update(pk, loc, &plan.sets);
+                }
+            }
+            self.tables.enforce_budget();
+        }
+        Ok(if self.semantics.update_counts_matched { matched } else { keys.len() as u64 })
+    }
+
+    /// DELETE outside a transaction, in the same way: the keys, then a frame
+    /// of deletes written as it is built.
+    fn delete_autocommit(&mut self, del: &Delete) -> DbResult<u64> {
+        let id = self.tables.lookup(&del.table)?;
+        let keys = query::delete_targets(&self.log, self.tables.table(id)?, None, del)?;
+        if !keys.is_empty() {
+            let mut frame = self.log.begin_frame(keys.len() as u64)?;
+            for &pk in &keys {
+                frame.delete(id, pk)?;
+            }
+            self.log.end_frame(frame)?;
+            if let Some(table) = self.tables.by_id.get_mut(&id) {
+                for &pk in &keys {
+                    table.apply_delete(pk);
+                }
+            }
+            self.tables.enforce_budget();
+        }
+        Ok(keys.len() as u64)
     }
 
     fn ddl(&mut self, stmt: &Statement) -> DbResult<()> {

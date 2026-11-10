@@ -622,6 +622,31 @@ impl Table {
         self.rows.insert(pk, Entry { loc, slot });
     }
 
+    /// Records a committed update of some columns of an existing row: its
+    /// new location and, if the row is cached, the new values in place.
+    pub fn apply_update(&mut self, pk: i64, loc: RowLoc, sets: &[(usize, Value)]) {
+        let Some(e) = self.rows.get_mut(&pk) else {
+            return;
+        };
+        e.loc = loc;
+        let slot = e.slot;
+        let (Some(cache), true) = (&mut self.cache, slot != NO_SLOT) else {
+            return;
+        };
+        for (col, value) in sets {
+            cache.cols[*col].set(slot as usize, value.clone());
+            if let (true, Value::Vector(v)) = (Some(*col) == self.vector_col, value) {
+                if let Some(ix) = &mut self.index {
+                    ix.remove(slot);
+                    ix.insert(slot, v);
+                }
+                if let Some(codes) = &mut self.codes {
+                    codes.set(slot, v);
+                }
+            }
+        }
+    }
+
     pub fn apply_delete(&mut self, pk: i64) {
         if let Some(e) = self.rows.remove(&pk) {
             if let (Some(cache), true) = (&mut self.cache, e.slot != NO_SLOT) {
@@ -1008,6 +1033,95 @@ mod tests {
             let mut got = TopK::new(&q, k);
             table.topk(&preds, |_| false, |_| true, &mut got).unwrap();
             assert_eq!(got.into_sorted(), want.into_sorted(), "{opts:?} query {qi}");
+        }
+    }
+
+    /// Updating some columns of a row in place leaves the table as writing
+    /// the whole new row does: the same rows, and the same TopK with every
+    /// combination of lists and codes.
+    #[test]
+    fn apply_update_equals_apply_put() {
+        let def = TableDef {
+            id: 1,
+            name: "t".into(),
+            columns: vec![
+                Column { name: "id".into(), ty: DataType::BigInt },
+                Column { name: "cat".into(), ty: DataType::Varchar(8) },
+                Column { name: "n".into(), ty: DataType::BigInt },
+                Column { name: "v".into(), ty: DataType::Vector(8) },
+            ],
+            pk: 0,
+            vector_index: None,
+        };
+        for (lists, codes) in [(true, true), (true, false), (false, true), (false, false)] {
+            let opts = IndexOptions { min_rows: 1, max_list_rows: usize::MAX, lists, codes };
+            let mut x = 7u64;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let mut vector = |scale: f32| -> Vec<f32> {
+                (0..8).map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale).collect()
+            };
+            let loc = |n: u64| RowLoc { seg: 1, off: n, len: 9 };
+            let (mut whole, mut in_place) = (Table::new(def.clone()), Table::new(def.clone()));
+            let mut model: BTreeMap<i64, Vec<Value>> = BTreeMap::new();
+            for pk in 0..600 {
+                let row = vec![Value::Int(pk), Value::Str(format!("c{}", pk % 3)), Value::Int(pk * 2), Value::Vector(vector(1.0))];
+                whole.apply_put(pk, loc(0), Some(row.clone()));
+                in_place.apply_put(pk, loc(0), Some(row.clone()));
+                model.insert(pk, row);
+            }
+            whole.prepare_index(opts);
+            in_place.prepare_index(opts);
+            for step in 0..900u64 {
+                let pk = (step * 7919 % 600) as i64;
+                // One, two or three columns; some vectors far outside the
+                // range the codes were fitted to.
+                let mut sets = Vec::new();
+                if step % 2 == 0 {
+                    sets.push((1, Value::Str(format!("s{}", step % 5))));
+                }
+                if step % 3 == 0 {
+                    sets.push((2, Value::Int(step as i64)));
+                }
+                if step % 4 != 1 {
+                    sets.push((3, Value::Vector(vector(if step % 9 == 0 { 40.0 } else { 1.0 }))));
+                }
+                let row = model.get_mut(&pk).unwrap();
+                for (col, v) in &sets {
+                    row[*col] = v.clone();
+                }
+                whole.apply_put(pk, loc(step + 1), Some(row.clone()));
+                in_place.apply_update(pk, loc(step + 1), &sets);
+            }
+            for (pk, row) in &model {
+                let e = in_place.rows[pk];
+                assert_eq!(e.loc, whole.rows[pk].loc);
+                assert_eq!(&in_place.cache.as_ref().unwrap().view(e.slot as usize).to_values(), row, "{opts:?} row {pk}");
+            }
+            for qi in 0..100u64 {
+                let q = vector(if qi % 10 == 0 { 30.0 } else { 1.0 });
+                let cat = format!("s{}", qi % 5);
+                let preds: Vec<ColPred<'_>> =
+                    if qi % 2 == 0 { Vec::new() } else { vec![ColPred { col: 1, op: CmpOp::Eq, value: PredValue::Str(&cat) }] };
+                let (mut a, mut b) = (TopK::new(&q, 10), TopK::new(&q, 10));
+                whole.topk(&preds, |_| false, |_| true, &mut a).unwrap();
+                in_place.topk(&preds, |_| false, |_| true, &mut b).unwrap();
+                let mut want = TopK::new(&q, 10);
+                for (&pk, row) in &model {
+                    if preds.iter().all(|p| p.test(&RowView::new(pk, row))) {
+                        if let Value::Vector(v) = &row[3] {
+                            want.offer(pk, v);
+                        }
+                    }
+                }
+                let want = want.into_sorted();
+                assert_eq!(b.into_sorted(), want, "{opts:?} query {qi}, in place");
+                assert_eq!(a.into_sorted(), want, "{opts:?} query {qi}, whole rows");
+            }
         }
     }
 
