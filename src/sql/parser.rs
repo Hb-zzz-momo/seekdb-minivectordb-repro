@@ -3,7 +3,7 @@
 //! `Unsupported` rather than `Syntax`, so they are never silently reinterpreted.
 
 use super::ast::*;
-use super::lexer::{skip_space, tokenize, Tok, Token};
+use super::lexer::{tokenize, Tok, Token};
 use crate::error::{DbError, DbResult};
 use crate::types::DataType;
 use crate::{bail, db_err};
@@ -24,11 +24,6 @@ const UNSUPPORTED_VERBS: &[&str] = &[
 
 fn is_reserved(word: &str) -> bool {
     RESERVED.iter().any(|r| r.eq_ignore_ascii_case(word))
-}
-
-/// True if `sql` holds only whitespace and complete comments.
-pub fn is_blank(sql: &str) -> bool {
-    matches!(skip_space(sql, 0), Ok(i) if i == sql.len())
 }
 
 /// Parses one statement; a trailing `;` is allowed.

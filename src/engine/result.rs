@@ -32,8 +32,11 @@ pub enum ExecResult {
 /// What a statement did. A result set went to the statement's `RowSink`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
+    /// INSERT, UPDATE or DELETE, with its row count.
     Affected(u64),
     Rows,
+    /// DDL, transaction control or SET: success without a count.
+    Done,
 }
 
 /// Receives a result set while it is produced: the column names, then each

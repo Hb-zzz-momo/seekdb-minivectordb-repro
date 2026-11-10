@@ -721,18 +721,23 @@ ERROR_KINDS = {
 
 
 class Db:
+    """The database behind the judge's protocol (STDIO_PROTOCOL.md): one JSON
+    request per line, one JSON response per request. Results are handed on
+    in the model's shape: {"ok", "affected"}, {"columns", "rows"} or
+    {"error"}."""
+
     def __init__(self, binary, data_dir, log_path, timeout, wait_ready=True):
         self.timeout = timeout
         self.log = open(log_path, "ab")
-        env = dict(os.environ, MVDB_FORMAT="jsonl")
+        self.seq = 0
         self.p = subprocess.Popen(
             [binary, "--data-dir", data_dir],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
         )
         if not wait_ready:
             return
         ready = self._readline()
-        if json.loads(ready) != {"ready": True}:
+        if json.loads(ready) != {"type": "ready"}:
             raise Crashed(f"bad ready line {ready!r}")
 
     def _readline(self):
@@ -746,16 +751,30 @@ class Db:
             raise Crashed(f"no output (exit code {self.p.poll()})")
         return line.decode()
 
-    def send(self, sql):
-        self.p.stdin.write((sql + ";\n").encode())
+    def _request(self, **fields):
+        self.seq += 1
+        line = json.dumps({"id": self.seq, **fields}, ensure_ascii=False) + "\n"
+        self.p.stdin.write(line.encode())
         self.p.stdin.flush()
+
+    def _response(self):
+        r = json.loads(self._readline())
+        if r.get("id") != self.seq or type(r.get("ok")) is not bool:
+            raise Crashed(f"response {r} to request {self.seq}")
+        return r
+
+    def send(self, sql):
+        self._request(op="execute", sql=sql + ";", search_mode="exact")
 
     def query(self, sql):
         self.send(sql)
-        r = json.loads(self._readline())
-        if "error" in r:
-            r["error"] = ERROR_KINDS.get(r["error"], r["error"])
-        return r
+        r = self._response()
+        if not r["ok"]:
+            code = r["error"]["code"]
+            return {"error": ERROR_KINDS.get(code, code), "message": r["error"].get("message")}
+        if "columns" in r:
+            return {"columns": r["columns"], "rows": r["rows"]}
+        return {"ok": True, "affected": r.get("affected_rows", 0)}
 
     def kill(self):
         self.p.kill()
@@ -763,15 +782,19 @@ class Db:
         self.log.close()
 
     def close(self):
+        """A normal shutdown as the judge does it: the acknowledgement, then
+        nothing more on stdout and exit status 0."""
         try:
-            self.p.stdin.write(b"quit;\n")
+            self._request(op="shutdown")
+            ack = self._response()
             self.p.stdin.close()
         except BrokenPipeError:
-            pass
+            ack = None
+        extra = self.p.stdout.read()
         code = self.p.wait(timeout=self.timeout)
         self.log.close()
-        if code != 0:
-            raise Crashed(f"exit code {code} on quit")
+        if ack != {"id": self.seq, "ok": True} or extra or code != 0:
+            raise Crashed(f"shutdown: answer {ack}, then {extra!r}, exit code {code}")
 
 
 # ---------------------------------------------------------------- comparison

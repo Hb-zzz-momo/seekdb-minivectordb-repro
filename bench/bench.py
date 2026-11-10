@@ -60,6 +60,8 @@ def parse_args():
                     help="multi: one autocommit INSERT of --batch rows; txn: BEGIN, --batch single-row INSERTs, COMMIT")
     ap.add_argument("--phase", choices=["all", "write", "query"], default="all")
     ap.add_argument("--mem-max", default="1G", help="MemoryMax of the database unit")
+    ap.add_argument("--cpus", default="", help="with --docker: the container's --cpus (the judge uses 2)")
+    ap.add_argument("--search-mode", choices=["exact", "ann"], default="exact", help="search_mode of every request")
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE passed to the database")
     ap.add_argument("--with-distance", action="store_true", help="also select the distance and check it")
     ap.add_argument("--drop-between-queries", action="store_true",
@@ -161,15 +163,18 @@ def docker_cmd(args):
 
 class Db:
     def __init__(self, a, data_dir, unit, log_path):
+        self.mode = a.search_mode
+        self.seq = 0
         if a.docker:
-            env = ["-e", "MVDB_FORMAT=jsonl"]
+            env = []
             for kv in a.env:
                 env += ["-e", kv]
+            cpus = ["--cpus", a.cpus] if a.cpus else []
             cmd = docker_cmd(["run", "-i", "--rm", "--name", unit, "--user", f"{os.getuid()}:{os.getgid()}",
-                              "-m", a.mem_max, "--memory-swap", a.mem_max] + env
+                              "-m", a.mem_max, "--memory-swap", a.mem_max] + cpus + env
                              + ["-v", f"{os.path.abspath(data_dir)}:/data", a.docker])
         else:
-            env = ["-E", "MVDB_FORMAT=jsonl"]
+            env = []
             for kv in a.env:
                 env += ["-E", kv]
             cmd = (["systemd-run", "--user", "--pipe", "--quiet", "--collect", f"--unit={unit}",
@@ -182,7 +187,7 @@ class Db:
                                   text=True, encoding="utf-8", bufsize=1)
         ready = self.p.stdout.readline()
         self.t_ready = time.perf_counter()
-        if json.loads(ready or "{}").get("ready") is not True:
+        if json.loads(ready or "{}") != {"type": "ready"}:
             self.fail(f"no ready line, got {ready!r}")
         if a.docker:
             out = subprocess.run(docker_cmd(["inspect", "-f", "{{.Id}} {{.State.Pid}}", unit]),
@@ -203,13 +208,23 @@ class Db:
             tail = f.read()[-2000:]
         sys.exit(f"database {self.unit}: {why}\n--- stderr ---\n{tail}")
 
-    def run(self, sql):
-        self.p.stdin.write(sql + "\n")
+    def request(self, what, **fields):
+        """One request in the judge's protocol (STDIO_PROTOCOL.md) and its response."""
+        self.seq += 1
+        self.p.stdin.write(json.dumps({"id": self.seq, **fields}, ensure_ascii=False) + "\n")
         self.p.stdin.flush()
         line = self.p.stdout.readline()
         if not line:
-            self.fail(f"exited while running {sql[:120]!r}")
-        return json.loads(line)
+            self.fail(f"exited while running {what[:120]!r}")
+        r = json.loads(line)
+        if r.get("id") != self.seq or type(r.get("ok")) is not bool:
+            self.fail(f"response {line[:200]!r} to request {self.seq}")
+        return r
+
+    def run(self, sql):
+        """Executes one statement; a failure comes back as {"error": code}."""
+        r = self.request(sql, op="execute", sql=sql, search_mode=self.mode)
+        return r if r["ok"] else {"error": r["error"]["code"], "message": r["error"].get("message")}
 
     def mem(self):
         """(memory.peak, memory.current) so far, in bytes."""
@@ -247,9 +262,12 @@ class Db:
         }
 
     def close(self):
-        self.p.stdin.write("quit\n")
+        ack = self.request("shutdown", op="shutdown")
         self.p.stdin.close()
+        extra = self.p.stdout.read()
         code = self.p.wait(timeout=30)
+        if ack != {"id": self.seq, "ok": True} or extra:
+            sys.exit(f"database {self.unit}: shutdown answered {ack}, then {extra[:200]!r}")
         self.log.close()
         with open(self.log.name, encoding="utf-8") as f:
             err = f.read()

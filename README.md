@@ -1,21 +1,25 @@
 # MiniVectorDB
 
-A single-process vector database for the OceanBase 2026 tiebreaker task: SQL over
-stdin/stdout, durable transactions, crash recovery and exact/approximate
-`L2_DISTANCE` TopK search. Written in Rust with no third-party dependencies.
+A single-process vector database for the OceanBase 2026 tiebreaker task: SQL
+requests over stdin/stdout (the judge's JSON protocol, `STDIO_PROTOCOL.md`),
+durable transactions, crash recovery and exact `L2_DISTANCE` TopK search.
+Written in Rust 1.98.1 with no third-party dependencies.
 
 ## Build and run
 
 ```bash
 cargo build --release
-./target/release/minivectordb --data-dir ./data      # SQL on stdin
+./target/release/minivectordb --data-dir ./data      # JSON requests on stdin
 
 docker build -t minivectordb .
 docker run -i --rm -v mvdb-data:/data minivectordb   # -i only: no -t, no -d
 ```
 
-The data directory defaults to `/data` and can be changed with `--data-dir` or
-`MVDB_DATA_DIR`. Logs go to stderr; stdout carries only results.
+The image's entry point is `minivectordb --data-dir /data`. The data
+directory defaults to `/data` and can be changed with `--data-dir` or
+`MVDB_DATA_DIR`; nothing is written anywhere else, so the image runs with a
+read-only root file system. Logs go to stderr; stdout carries only protocol
+lines. A session from an empty directory is shown under [Protocol](#protocol).
 
 ## Status
 
@@ -30,11 +34,11 @@ The data directory defaults to `/data` and can be changed with `--data-dir` or
 | Docker image (pinned bases, `tests/docker_smoke.sh`) | builds, smoke-tested, benchmarked |
 | Write path: single-pass vector parsing, no re-lexing | done, unit- and differential-tested, measured |
 | Row cache built on first read; dictionary codes for `=`/`<>` on strings | done, unit-, differential- and crash-tested, measured |
-| One statement per input line; semantic error names (`duplicate_key`, ...) | done, as the public cases define them |
+| Semantic error codes (`duplicate_key`, `unsupported_sql`, ...) | done, as the public cases define them |
 | Result rows streamed to stdout (bounded memory for any result size) | done, unit-, differential- and memory-tested |
-| Wire format, ready marker, ANN mode switch | waiting for the official test driver |
+| The judge's JSON protocol: ready line, `execute`, `shutdown`, `search_mode` | done; the organizers' checker passes on the image (handshake and 20/20 public cases) |
 | Exact vector index (k-means lists and 8-bit codes, triangle-inequality bounds) | done, unit-, differential- and crash-tested, measured |
-| Organizers' public sample cases (`mysqltest/`, v4) | 20/20 pass (`tests/public_cases.py`) |
+| Organizers' public sample cases (`mysqltest/`, v4) | 20/20 pass through `protocol_check/run.py` |
 | Approximate (ANN) mode, log compaction | next |
 
 ## Testing
@@ -49,32 +53,35 @@ MVDB_IVF_MIN_ROWS=1 MVDB_IVF_MAX_ROWS=30 python3 tests/difftest.py --seeds 0:100
 python3 tests/public_cases.py                                   # the organizers' sample cases in mysqltest/
 ```
 
-`tests/public_cases.py` runs each case listed in `mysqltest/manifest.json`
-on a fresh data directory and checks every result against its `.result`
-assertions as `mysqltest/README.md` describes them (exact integers, strings
-and column names; floats within 1e-5; `unordered` as a multiset; `error` by
-its semantic name). A `--restart` line closes stdin, waits for the exit and
-starts again on the same directory; `--mode ann` is only noted, since how the
-official driver switches modes is not published and exact answers are valid
-approximate ones.
+`tests/public_cases.py` runs the organizers' own checker,
+`protocol_check/run.py`, against the release binary: it waits for the ready
+line, sends every statement of every case in `mysqltest/manifest.json` as a
+JSON request, restarts on `--restart` (a `shutdown` request, then a new
+process on the same directory), sets `search_mode` to `ann` after
+`--mode ann`, and compares each response with the case's `.result`
+assertions as the judge does (exact integers, strings and column names;
+floats within 1e-5; `unordered` as a multiset; a non-empty `error.code`).
 
 `tests/difftest.py` generates random sessions (DDL, multi-row INSERT with
 duplicate keys and invalid values, UPDATE, DELETE, filtered SELECT, TopK,
 BEGIN/COMMIT/ROLLBACK) and compares every result with a reference model
 written in Python. In `--crash` mode it also kills the database at random
 points, including while a commit is in flight and while recovery is running,
-and checks the recovered contents equal the model's committed state. Set
-`MVDB_FORMAT=jsonl` to get the same machine-readable output by hand.
+and checks the recovered contents equal the model's committed state. It
+speaks the judge's protocol, and every normal restart is a `shutdown`
+request that must be acknowledged and followed by exit status 0.
 
 ```bash
 docker build -t minivectordb:smoke .
 tests/docker_smoke.sh minivectordb:smoke
 ```
 
-The smoke test runs the image the way the grader does (`docker run -i`, a
-volume at `/data`): statements, a rolled-back transaction, a filtered TopK,
-data surviving a restart, an acknowledged commit surviving `docker kill`, and
-a clean exit on `quit` and at end of input.
+The smoke test runs the image with the judge's container options
+(`docker run -i`, no network, 2 CPUs, 2 GiB, a read-only root file system, no
+capabilities, a volume at `/data`): the organizers' checker (handshake and
+all public cases), then statements, a rolled-back transaction, a filtered
+TopK, data surviving a restart, an acknowledged commit surviving
+`docker kill`, and a clean exit at end of input.
 
 ## Performance
 
@@ -259,17 +266,76 @@ as one flat list.
 
 ## Protocol
 
-Each non-empty input line is one complete statement; a trailing `;` is
-optional, an unclosed quote or comment is that line's syntax error, and a
-line holding only a comment gets no response. `quit` or `exit` (or end of
-input) ends the session; an open transaction is rolled back. Errors carry a
-semantic name (`duplicate_key`, `unsupported_sql`, `dimension_mismatch` as
-in the public cases; the rest, such as `table_not_found` or
-`invalid_value`, are ours until the official mapping is published). Result
-rows are written while they are produced: a response is held back until it
-passes 64 KiB, then streamed, so `SELECT *` over a table larger than memory
-adds no measurable memory (100,000 x 128 rows in a 64 MiB container).
-ORDER BY on anything but the primary key still keeps every matching row's
-sort key (about 10-25 MiB at 100,000 rows), and TopK its K ids.
-`MVDB_FORMAT=jsonl` prints one JSON object per statement; the default text
-format is a placeholder until the official driver is published.
+The judge's protocol, as `STDIO_PROTOCOL.md` defines it: UTF-8 JSON Lines,
+one object per line in each direction, flushed after every line.
+
+- After recovery the database prints `{"type":"ready"}`, before it reads
+  anything.
+- `{"id":N,"op":"execute","sql":"...","search_mode":"exact"}` runs one
+  statement (a trailing `;` is optional; the SQL may span lines). The answer
+  repeats `id` exactly as it was sent, whatever its JSON type:
+  - a query: `{"id":N,"ok":true,"columns":[...],"rows":[[...],...]}`;
+  - INSERT, UPDATE, DELETE: `{"id":N,"ok":true,"affected_rows":K}`;
+  - DDL, BEGIN, COMMIT, ROLLBACK: `{"id":N,"ok":true}`;
+  - a failure: `{"id":N,"ok":false,"error":{"code":"...","message":"..."}}`,
+    after which the session continues.
+- `{"id":N,"op":"shutdown"}` rolls back an open transaction, answers
+  `{"id":N,"ok":true}` and exits with status 0. End of input without it also
+  exits with status 0.
+- `search_mode` may be `exact` or `ann`. Vector searches are exact in both:
+  an exact answer satisfies every check on an approximate one.
+- BIGINT values are JSON integers, distances and vector elements are JSON
+  numbers that always carry a `.` or an exponent (`5.0`), strings are JSON
+  strings.
+- Error codes: `duplicate_key`, `unsupported_sql`, `dimension_mismatch` (the
+  three the public cases name), `syntax_error`, `table_not_found`,
+  `table_exists`, `column_not_found`, `column_count_mismatch`,
+  `missing_value`, `type_mismatch`, `out_of_range`, `data_too_long`,
+  `invalid_value`, `invalid_schema`, `io_error`, `corrupt_data`,
+  `internal_error`; `invalid_request` and `unsupported_op` for a line that
+  is not a usable request. The official mapping is not frozen; the judge
+  currently requires only a non-empty code.
+- A result set is held back until it passes 64 KiB, then written while it is
+  produced, with `"ok"` at the end of the object instead of the front, so a
+  result of any size needs bounded memory. ORDER BY on anything but the
+  primary key still keeps every matching row's sort key, and TopK its K ids.
+
+A session from an empty data directory (`>` is a request, `<` a response):
+
+```text
+< {"type":"ready"}
+> {"id":1,"op":"execute","sql":"CREATE TABLE docs (id BIGINT PRIMARY KEY, category VARCHAR(32), content VARCHAR(1024), embedding VECTOR(4));","search_mode":"exact"}
+< {"id":1,"ok":true}
+> {"id":2,"op":"execute","sql":"INSERT INTO docs VALUES (1, 'database', '事务与恢复', '[1, 0, 0, 0]'), (2, 'database', '向量索引', '[0, 1, 0, 0]'), (3, 'travel', '旅行攻略', '[0, 0, 1, 0]');","search_mode":"exact"}
+< {"id":2,"ok":true,"affected_rows":3}
+> {"id":3,"op":"execute","sql":"SELECT id, content FROM docs WHERE id >= 2 ORDER BY id;","search_mode":"exact"}
+< {"id":3,"ok":true,"columns":["id","content"],"rows":[[2,"向量索引"],[3,"旅行攻略"]]}
+> {"id":4,"op":"execute","sql":"SELECT id, L2_DISTANCE(embedding, '[0.9, 0.1, 0, 0]') AS distance FROM docs WHERE category = 'database' ORDER BY distance LIMIT 2;","search_mode":"exact"}
+< {"id":4,"ok":true,"columns":["id","distance"],"rows":[[1,0.141421374149721],[2,1.272792188223375]]}
+> {"id":5,"op":"execute","sql":"BEGIN;","search_mode":"exact"}
+< {"id":5,"ok":true}
+> {"id":6,"op":"execute","sql":"UPDATE docs SET embedding = '[0.8, 0.2, 0, 0]' WHERE id = 1;","search_mode":"exact"}
+< {"id":6,"ok":true,"affected_rows":1}
+> {"id":7,"op":"execute","sql":"COMMIT;","search_mode":"exact"}
+< {"id":7,"ok":true}
+> {"id":8,"op":"execute","sql":"BEGIN;","search_mode":"exact"}
+< {"id":8,"ok":true}
+> {"id":9,"op":"execute","sql":"DELETE FROM docs WHERE id = 2;","search_mode":"exact"}
+< {"id":9,"ok":true,"affected_rows":1}
+> {"id":10,"op":"execute","sql":"ROLLBACK;","search_mode":"exact"}
+< {"id":10,"ok":true}
+> {"id":11,"op":"execute","sql":"INSERT INTO docs VALUES (1, 'dup', 'x', '[0, 0, 0, 0]');","search_mode":"exact"}
+< {"id":11,"ok":false,"error":{"code":"duplicate_key","message":"duplicate entry '1' for key 'PRIMARY'"}}
+> {"id":12,"op":"shutdown"}
+< {"id":12,"ok":true}
+```
+
+and after a restart on the same directory:
+
+```text
+< {"type":"ready"}
+> {"id":1,"op":"execute","sql":"SELECT id, L2_DISTANCE(embedding, '[0.9, 0.1, 0, 0]') AS distance FROM docs ORDER BY distance LIMIT 3;","search_mode":"exact"}
+< {"id":1,"ok":true,"columns":["id","distance"],"rows":[[1,0.14142133200287407],[2,1.272792188223375],[3,1.3490737405281743]]}
+> {"id":2,"op":"shutdown"}
+< {"id":2,"ok":true}
+```

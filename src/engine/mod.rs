@@ -218,6 +218,7 @@ impl Engine {
         let mut rows = Collect::default();
         Ok(match self.execute_into(stmt, &mut rows)? {
             Outcome::Affected(affected) => ExecResult::Ok { affected },
+            Outcome::Done => ExecResult::Ok { affected: 0 },
             Outcome::Rows => ExecResult::Rows { columns: rows.columns, rows: rows.rows },
         })
     }
@@ -229,22 +230,22 @@ impl Engine {
             Statement::Begin => {
                 let r = self.commit();
                 self.txn.explicit = r.is_ok();
-                r.map(|_| Outcome::Affected(0))
+                r.map(|_| Outcome::Done)
             }
             Statement::Commit => {
                 let r = self.commit();
                 self.txn.explicit = false;
-                r.map(|_| Outcome::Affected(0))
+                r.map(|_| Outcome::Done)
             }
             Statement::Rollback => {
                 self.abort_transaction();
-                Ok(Outcome::Affected(0))
+                Ok(Outcome::Done)
             }
             Statement::CreateTable(_) | Statement::DropTable { .. } | Statement::CreateVectorIndex(_) => {
                 let r = self.commit();
                 self.txn.explicit = false;
                 r?;
-                self.ddl(stmt).map(|_| Outcome::Affected(0))
+                self.ddl(stmt).map(|_| Outcome::Done)
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
                 match stmt {
@@ -293,7 +294,7 @@ impl Engine {
                     _ => bail!(Unsupported, "unsupported value for SET {}", name),
                 };
                 self.vars.insert(name.to_ascii_lowercase(), v);
-                Ok(Outcome::Affected(0))
+                Ok(Outcome::Done)
             }
         }
     }
