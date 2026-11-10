@@ -285,6 +285,13 @@ class Stmt:
 # ---------------------------------------------------------------- model
 
 
+# Rules the task text leaves open, set from --nested-begin and --update-count
+# for the model and, through the environment, for the database it checks
+# (Semantics in src/engine/mod.rs).
+NESTED_BEGIN_IS_ERROR = True
+UPDATE_COUNTS_MATCHED = True
+
+
 class Model:
     def __init__(self):
         self.db = {}
@@ -318,6 +325,8 @@ class Model:
     def _execute(self, st):
         k = st.kind
         if k == "begin":
+            if self.in_txn and NESTED_BEGIN_IS_ERROR:
+                raise ModelError("Unsupported")
             self.commit()
             self.in_txn = True
             return {"ok": True, "affected": 0}
@@ -407,11 +416,12 @@ class Model:
                 raise ModelError("Unsupported")
             sets.append((i, coerce(lit, t.cols[i])))
         pred = compile_cond(t, st.where)
-        changed = 0
+        matched = changed = 0
         for pk in sorted(t.rows):
             row = t.rows[pk]
             if not pred(row):
                 continue
+            matched += 1
             new = list(row)
             for i, v in sets:
                 new[i] = v
@@ -419,7 +429,7 @@ class Model:
             if new != row:
                 t.rows[pk] = new
                 changed += 1
-        return changed
+        return matched if UPDATE_COUNTS_MATCHED else changed
 
     def delete(self, s, st):
         t = self.table(s, st.table)
@@ -992,7 +1002,15 @@ def main():
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--keep", action="store_true", help="keep data dirs of passing seeds")
     ap.add_argument("--stats", action="store_true", help="print how often each outcome was checked")
+    ap.add_argument("--nested-begin", choices=["error", "commit"], default="error",
+                    help="BEGIN inside a transaction: an error that keeps it open, or an implicit commit")
+    ap.add_argument("--update-count", choices=["matched", "changed"], default="matched",
+                    help="UPDATE reports the rows its WHERE matched, or only those whose values changed")
     args = ap.parse_args()
+    global NESTED_BEGIN_IS_ERROR, UPDATE_COUNTS_MATCHED
+    NESTED_BEGIN_IS_ERROR = args.nested_begin == "error"
+    UPDATE_COUNTS_MATCHED = args.update_count == "matched"
+    os.environ.update(MVDB_NESTED_BEGIN=args.nested_begin, MVDB_UPDATE_COUNT=args.update_count)
     lo, hi = (int(x) for x in args.seeds.split(":"))
     failed = [s for s in range(lo, hi) if not run_seed(args, s)]
     if args.stats:

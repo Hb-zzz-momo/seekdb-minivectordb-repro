@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use minivectordb::engine::{Engine, EngineOptions, IndexOptions};
+use minivectordb::engine::{Engine, EngineOptions, IndexOptions, Semantics};
 use minivectordb::protocol;
 use minivectordb::sql::ast::{Expr, Literal, Statement};
 use minivectordb::sql;
@@ -71,7 +71,7 @@ fn fresh_dir(name: &str) -> PathBuf {
 }
 
 fn execute_all(stmts: &[Statement], sync: bool) {
-    let opts = EngineOptions { log: LogOptions { sync, ..LogOptions::default() }, cache_budget: 256 << 20, index: IndexOptions { min_rows: usize::MAX, max_list_rows: 0, lists: false, codes: false } };
+    let opts = EngineOptions { log: LogOptions { sync, ..LogOptions::default() }, cache_budget: 256 << 20, index: IndexOptions { min_rows: usize::MAX, max_list_rows: 0, lists: false, codes: false }, semantics: Semantics::default() };
     let mut engine = Engine::open(&fresh_dir("write_path_probe"), opts).unwrap();
     for s in stmts {
         engine.execute(s).unwrap();

@@ -227,14 +227,20 @@ to 1) and `MVDB_IVF_MAX_ROWS` (largest table that gets lists).
 
 ## Semantics chosen where the task text is silent
 
-Approved by the student; still to be checked against the official test
-package when it is published. The organizers' public cases (`mysqltest/`)
+Decided by the student; the official error-code mapping and the hidden
+cases are still unpublished. The organizers' public cases (`mysqltest/`)
 touch none of these; they do confirm that ORDER BY ties go to the smaller
 primary key (also under `DESC`), that strings compare by code point, and
 that `L2_DISTANCE` is the distance, not its square.
 
-- DDL and `BEGIN` implicitly commit an open transaction (as in MySQL);
-  `COMMIT`/`ROLLBACK` outside a transaction are no-ops.
+- `BEGIN` inside a transaction is an `unsupported_sql` error and leaves the
+  transaction open: the task lists nested transactions among the unsupported
+  features, and unsupported statements must fail rather than run with
+  another meaning. DDL implicitly commits an open transaction (as in MySQL);
+  `COMMIT`/`ROLLBACK` outside a transaction succeed and do nothing.
+- `UPDATE` reports the rows its WHERE clause matched, whether or not their
+  values changed: the expected results come from the organizers' reference
+  executor, not from MySQL, whose default would count only changed rows.
 - `UPDATE ... SET` values are validated before any row is matched, so a bad
   value is an error even when no row matches.
 - Comparing a number with a string, or storing a number in a VARCHAR/VECTOR
@@ -242,6 +248,11 @@ that `L2_DISTANCE` is the distance, not its square.
   conversion. A decimal literal stored in BIGINT must be integral.
 - Rows without ORDER BY come back in primary-key order.
 - Table and column names are case-insensitive.
+
+The first two are one-line switches (`Semantics` in `src/engine/mod.rs`),
+also settable for a test run with `MVDB_NESTED_BEGIN=error|commit` and
+`MVDB_UPDATE_COUNT=matched|changed`; `tests/difftest.py --nested-begin` and
+`--update-count` check the engine against the model under either choice.
 
 ## Storage design
 

@@ -158,7 +158,9 @@ pub(super) fn insert(tables: &Tables, txn: &mut Txn, ins: &Insert) -> DbResult<u
     Ok(ins.rows.len() as u64)
 }
 
-pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update) -> DbResult<u64> {
+/// Returns the rows the WHERE clause matched and, of those, the rows whose
+/// values changed. Only the changed rows are written.
+pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update) -> DbResult<(u64, u64)> {
     let id = tables.lookup(&up.table)?;
     let table = tables.table(id)?;
     let def = &table.def;
@@ -181,7 +183,7 @@ pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update
             Ok(true)
         })?;
     }
-    let mut changed = 0;
+    let (matched_rows, mut changed) = (matched.len() as u64, 0);
     for mut values in matched {
         let mut diff = false;
         for (col, v) in &sets {
@@ -196,7 +198,7 @@ pub(super) fn update(log: &LogStore, tables: &Tables, txn: &mut Txn, up: &Update
             changed += 1;
         }
     }
-    Ok(changed)
+    Ok((matched_rows, changed))
 }
 
 pub(super) fn delete(log: &LogStore, tables: &Tables, txn: &mut Txn, del: &Delete) -> DbResult<u64> {
