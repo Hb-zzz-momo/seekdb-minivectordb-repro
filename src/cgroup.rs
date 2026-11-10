@@ -72,6 +72,12 @@ pub fn cpu_quota() -> Option<f64> {
     v2.chain(v1).min_by(f64::total_cmp)
 }
 
+/// Whether a process under `quota` (from `cpu_quota`) can keep one thread
+/// busy without being throttled.
+pub fn has_a_whole_cpu(quota: Option<f64>) -> bool {
+    quota.is_none_or(|q| q >= 1.0)
+}
+
 /// Physical memory of the machine, in bytes.
 pub fn mem_total() -> Option<u64> {
     parse_mem_total(&read("/proc/meminfo")?)
@@ -123,6 +129,17 @@ mod tests {
         assert_eq!(parse_cpu_max("max 100000\n"), None);
         assert_eq!(parse_cpu_max("-1 100000"), None);
         assert_eq!(parse_cpu_max(""), None);
+    }
+
+    #[test]
+    fn whole_cpus() {
+        // The judge's container has 2 CPUs; no quota at all also counts.
+        assert!(has_a_whole_cpu(parse_cpu_max("200000 100000")));
+        assert!(has_a_whole_cpu(parse_cpu_max("100000 100000")));
+        assert!(has_a_whole_cpu(parse_cpu_max("max 100000")));
+        assert!(has_a_whole_cpu(None));
+        assert!(!has_a_whole_cpu(parse_cpu_max("50000 100000")));
+        assert!(!has_a_whole_cpu(Some(0.99)));
     }
 
     #[test]

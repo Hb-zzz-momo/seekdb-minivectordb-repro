@@ -1,7 +1,12 @@
-use std::io::{self, BufRead, BufWriter, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::mem::ManuallyDrop;
+use std::os::unix::io::FromRawFd;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::time::Instant;
 
+use minivectordb::cgroup;
 use minivectordb::db_err;
 use minivectordb::engine::result::{Outcome, RowSink};
 use minivectordb::engine::{Engine, EngineOptions};
@@ -37,11 +42,21 @@ fn main() {
     let _ = protocol::write_ready(&mut out);
     let _ = out.flush();
 
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
+    // Standard input through a reader of our own, so that `Polling` can tell
+    // whether a request is already buffered.
+    // SAFETY: descriptor 0 is open for the life of the process, and
+    // `ManuallyDrop` keeps this handle from closing it.
+    let stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+    let mut input = BufReader::new(&*stdin);
+    let mut polling = Polling::from_env();
+    let mut after_query = false;
     let mut raw = Vec::new();
     loop {
         raw.clear();
+        if polling.on && after_query && input.buffer().is_empty() {
+            polling.wait();
+        }
+        after_query = false;
         match input.read_until(b'\n', &mut raw) {
             Ok(0) => break,
             Ok(_) => {}
@@ -66,6 +81,7 @@ fn main() {
             Ok(Request { id, op: Op::Execute { sql, .. } }) => {
                 let mut response = Response::new(&mut out, id);
                 let res = run(&mut engine, &sql, &mut response);
+                after_query = matches!(res, Ok(Outcome::Rows));
                 response.finish(res)
             }
             Ok(Request { id, op: Op::Shutdown }) => {
@@ -85,6 +101,76 @@ fn main() {
     }
     // End of input without a shutdown request: dropping the engine discards
     // any open transaction; every committed one is already durable.
+}
+
+/// After answering a query, the next request is waited for by polling
+/// standard input for a moment instead of sleeping in `read` at once. A
+/// client that sends its queries one after the other has the next one there
+/// within that moment, and a process that did not sleep answers it sooner:
+/// driven by the organizers' own transport with their container options,
+/// the benchmark's 1,000 queries take 5.7% less with 2 CPUs and 6.1% less
+/// with 1.
+///
+/// Polling uses a whole CPU while it waits, so it is on only where the
+/// process has one: under a quota of half a CPU a first version without this
+/// check made the query phase 43 to 61% slower. It follows queries only, so
+/// during a load the process sleeps between statements as before.
+struct Polling {
+    on: bool,
+    /// How long to poll before sleeping, in microseconds.
+    micros: u64,
+}
+
+/// A stall this long between two turns of the polling loop means the process
+/// was taken off the CPU while it polled, as a quota that cannot be read
+/// from inside would do: polling then stays off.
+const STALL_MICROS: u128 = 2_000;
+
+impl Polling {
+    /// One millisecond, or `MVDB_SPIN_US` microseconds (0 turns polling off);
+    /// off under a CPU quota of less than one CPU. The organizers' client
+    /// sends its next query about 180 us after an answer, so a window of
+    /// 200 us missed most of them; 500, 1,000 and 2,000 us measured alike.
+    fn from_env() -> Polling {
+        let micros = std::env::var("MVDB_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+        Polling { on: micros > 0 && cgroup::has_a_whole_cpu(cgroup::cpu_quota()), micros }
+    }
+
+    /// Returns once standard input is readable (or closed), or the time is up.
+    fn wait(&mut self) {
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        extern "C" {
+            fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+        }
+        const POLLIN: i16 = 1;
+        let mut fd = PollFd { fd: 0, events: POLLIN, revents: 0 };
+        let start = Instant::now();
+        let mut last = start;
+        loop {
+            // SAFETY: one valid pollfd; a zero timeout returns at once.
+            // Anything but "nothing yet" (input, end of input, an error) is
+            // left for `read` to report.
+            if unsafe { poll(&mut fd, 1, 0) } != 0 {
+                return;
+            }
+            let now = Instant::now();
+            if (now - last).as_micros() > STALL_MICROS {
+                self.on = false;
+                eprintln!("minivectordb: stalled {} us while polling stdin; polling is off", (now - last).as_micros());
+                return;
+            }
+            if (now - start).as_micros() >= self.micros as u128 {
+                return;
+            }
+            last = now;
+            std::hint::spin_loop();
+        }
+    }
 }
 
 /// SIGTERM and SIGINT end the session like end of input. Every acknowledged

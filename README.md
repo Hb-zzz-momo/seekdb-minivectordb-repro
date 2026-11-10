@@ -40,6 +40,7 @@ lines. A session from an empty directory is shown under [Protocol](#protocol).
 | The judge's JSON protocol: ready line, `execute`, `shutdown`, `search_mode` | done; the organizers' checker passes on the image (handshake and 20/20 public cases) |
 | Exact vector index (k-means lists and 8-bit codes, triangle-inequality bounds) | done, unit-, differential- and crash-tested, measured |
 | Organizers' public sample cases (`mysqltest/`, v4) | 20/20 pass through `protocol_check/run.py` |
+| Polling for the next query instead of sleeping (off under a CPU quota below 1) | done, measured through the organizers' transport |
 | Approximate (ANN) mode, log compaction | next |
 
 ## Testing
@@ -145,14 +146,40 @@ second read of the log). Recovery
 still decodes rows while it replays the log, since it reads them anyway, so
 a database reopened for queries starts with its cache ready.
 
-Median of five runs on an i5-9400F, NVMe ext4, through the judge's protocol:
+Medians on an i5-9400F, NVMe ext4, through the judge's protocol (the first
+four rows with `bench/bench.py`, five runs; the last two with the organizers'
+own transport, `protocol_check/_transport.py`, and their container options,
+ten runs):
 
 | Phase | T | Peak memory | Disk I/O |
 |---|---|---|---|
 | write (100 commits) | 204 ms | 1.7 MiB | 5.45 MiB written |
-| query (1,000 TopK, uniform data) | 154 ms | 7.9 MiB | 5.06 MiB read |
-| write, in the image (`--docker --cpus 2`) | 221 ms | 4.6-5.1 MiB | 5.45 MiB written |
-| query, in the image | 232 ms | 8.1 MiB | 5.06 MiB read |
+| query (1,000 TopK, uniform data) | 137 ms | 7.9 MiB | 5.06 MiB read |
+| write, in the image (`--docker --cpus 2`) | 221-225 ms | 4.4-5.4 MiB | 5.45 MiB written |
+| query, in the image | 230 ms | 8.1 MiB | 5.06 MiB read |
+| write, organizers' transport | 214 ms | | |
+| query, organizers' transport | 285 ms | | |
+
+After answering a query the database polls standard input for up to 1 ms
+before it sleeps in `read`, so the next query of a client that sends them
+back to back is picked up by a process that is still running. Through the
+organizers' transport, in random order with the version before it, the 1,000
+queries take 285.3 ms instead of 302.5 (-5.7%) with their 2 CPUs and 290.3
+instead of 309.1 (-6.1%) with 1; natively `bench.py` gives 137 instead of
+147 ms. The window is 1 ms because their client sends the next query about
+180 us after an answer: a first window of 200 us missed most of them (307 ms),
+while 500, 1,000 and 2,000 us gave 288 to 290 ms. Polling occupies a CPU, so
+it is on only without a CPU quota or with one of at least 1 CPU (read from
+`cpu.max`; with `--cpus=0.5` it is off), and it stops for good if the
+process is ever descheduled for 2 ms while polling. Without the first check
+a scratch build made the query phase 43 to 61% slower under half a CPU. It
+follows queries only: during the write phase the process polls once, after
+the last statement, and through the organizers' transport the write phase is
+unchanged (214.2 against 216.4 ms). `bench.py --docker` does show the write
+phase about 2% slower with polling on, but only when it passes the container
+no environment variable at all, also not an unrelated one; that was not
+explained and did not reproduce with the organizers' transport or with a
+minimal client.
 
 Inside the container `io.stat` reports the same bytes as `/proc/<pid>/io`,
 but times are higher: each statement's round trip through
@@ -242,7 +269,8 @@ budget; default a quarter of the memory limit of the process's cgroup or of
 any group above it, read from `/proc/self/cgroup` and `/sys/fs/cgroup`),
 `MVDB_DROP_CACHE=0` (keep log pages in the page cache),
 `MVDB_DEFER_CACHE=0` (keep a table's rows in memory while it is only written
-to), `MVDB_LOG_CHUNK` and `MVDB_BIG_FRAME` (bytes after which a frame is
+to), `MVDB_SPIN_US` (microseconds of polling for the next request after a
+query, default 1000; 0 turns it off), `MVDB_LOG_CHUNK` and `MVDB_BIG_FRAME` (bytes after which a frame is
 written in pieces, and replayed without being held in memory; the tests set
 them to 64 and 0), `MVDB_IVF=0` and
 `MVDB_SQ8=0` (leave out the lists or the codes), `MVDB_IVF_MIN_ROWS`
