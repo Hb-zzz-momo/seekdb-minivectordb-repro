@@ -299,6 +299,16 @@ impl Engine {
                 let r = self.commit();
                 self.txn.explicit = false;
                 r?;
+                // The index is built by this statement, not by the first
+                // query after it: bring back a row cache that a bulk load set
+                // aside. An empty table is left alone, so that a load which
+                // follows still keeps no rows in memory.
+                if let Statement::CreateVectorIndex(ix) = stmt {
+                    let id = self.tables.lookup(&ix.table).ok();
+                    if id.and_then(|id| self.tables.by_id.get(&id)).is_some_and(|t| !t.rows.is_empty()) {
+                        self.prepare_read(&ix.table)?;
+                    }
+                }
                 self.ddl(stmt).map(|_| Outcome::Done)
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
@@ -581,6 +591,47 @@ mod tests {
         db.run("BEGIN").unwrap();
         db.run("ROLLBACK").unwrap();
         assert_eq!(db.ids("SELECT id FROM t"), [1]);
+    }
+
+    fn only_table(db: &TestDb) -> &Table {
+        db.engine.tables.by_id.values().next().unwrap()
+    }
+
+    /// After a bulk load nothing is cached; CREATE VECTOR INDEX loads the
+    /// rows and builds the index itself, so the first TopK does not.
+    #[test]
+    fn create_vector_index_builds_the_index() {
+        let index = IndexOptions { min_rows: 1, max_list_rows: 50_000, lists: true, codes: true };
+        let mut db = TestDb::new(Semantics::default(), index);
+        db.run("CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))").unwrap();
+        for i in 0..40 {
+            db.run(&format!("INSERT INTO t VALUES ({i}, '[{i}, 1]')")).unwrap();
+        }
+        assert!(!only_table(&db).is_cached() && only_table(&db).index_parts() == (false, false));
+        db.run("CREATE VECTOR INDEX ix ON t(v)").unwrap();
+        assert!(only_table(&db).is_cached());
+        assert_eq!(only_table(&db).index_parts(), (true, true));
+        assert_eq!(db.ids("SELECT id FROM t ORDER BY L2_DISTANCE(v, '[7.2, 1]') LIMIT 3"), [7, 8, 6]);
+        // Rows written after it are indexed as they are committed.
+        db.run("INSERT INTO t VALUES (100, '[7.1, 1]')").unwrap();
+        assert_eq!(db.ids("SELECT id FROM t ORDER BY L2_DISTANCE(v, '[7.2, 1]') LIMIT 2"), [100, 7]);
+    }
+
+    /// On an empty table the statement loads nothing and does not mark the
+    /// table as read, so a bulk load after it keeps no rows in memory.
+    #[test]
+    fn create_vector_index_on_an_empty_table_keeps_the_load_cheap() {
+        let index = IndexOptions { min_rows: 1, max_list_rows: 50_000, lists: true, codes: true };
+        let mut db = TestDb::new(Semantics::default(), index);
+        db.run("CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))").unwrap();
+        db.run("CREATE VECTOR INDEX ix ON t(v)").unwrap();
+        assert!(!only_table(&db).read);
+        for i in 0..40 {
+            db.run(&format!("INSERT INTO t VALUES ({i}, '[{i}, 1]')")).unwrap();
+        }
+        assert!(!only_table(&db).is_cached());
+        assert_eq!(db.ids("SELECT id FROM t ORDER BY L2_DISTANCE(v, '[7.2, 1]') LIMIT 3"), [7, 8, 6]);
+        assert_eq!(only_table(&db).index_parts(), (true, true));
     }
 
     #[test]

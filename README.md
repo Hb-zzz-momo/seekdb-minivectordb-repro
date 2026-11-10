@@ -176,7 +176,9 @@ Results, ties included, are the same as a full scan: every bound carries a
 padding far above f64 rounding (and the float32 kernel's proven error bound
 where it uses float32 distances), and a row is skipped only when its bound
 is strictly greater than the K-th distance. The index is built during
-recovery, on `CREATE VECTOR INDEX`, or before a TopK once the table is big
+recovery, by `CREATE VECTOR INDEX` (which first loads the rows of a table
+that was only written to so far: 78 ms for 10,000 rows, after which the
+first TopK takes 0.2 ms), or before a TopK once the table is big
 enough or has doubled, never during the write phase; for 10,000 rows it
 adds about 60 ms (lists) and 10 ms (codes) to recovery. A filtered TopK
 skips the lists while they have recently had to visit more than half the

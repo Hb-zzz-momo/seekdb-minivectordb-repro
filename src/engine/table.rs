@@ -502,6 +502,12 @@ impl Table {
         self.cache.is_some()
     }
 
+    /// Whether the table has k-means lists and 8-bit codes right now.
+    #[cfg(test)]
+    pub fn index_parts(&self) -> (bool, bool) {
+        (self.index.is_some(), self.codes.is_some())
+    }
+
     pub fn cache_bytes(&self) -> usize {
         self.cache.as_ref().map_or(0, RowCache::bytes)
             + self.index.as_ref().map_or(0, Ivf::bytes)
