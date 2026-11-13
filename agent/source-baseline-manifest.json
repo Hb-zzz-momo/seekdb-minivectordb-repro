@@ -1,0 +1,158 @@
+{
+  "source_sha": "4d575f663c5e408987b441c53ece9c0189860908",
+  "source_repository": "https://github.com/zhangxh0526/seekdb",
+  "product_source_and_build_file_count": 30,
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "9101b9835a3282a6e0143b1d5a289a0456262157940d024220cbced75df975cd",
+      "bytes": 156
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "a51142d4993d2af5a868f7530fe3c24eca3275a92ee921c9dd5f0bc9f2e5e804",
+      "bytes": 619
+    },
+    {
+      "path": "Dockerfile",
+      "sha256": "2a7858fa8671b8149f005413ed96a32b4bfd5752bc913b2e238c5fccabde04e9",
+      "bytes": 839
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "0bf007546885bfdc84484863a3b2dd936a89627191998d987cd798759e3935f1",
+      "bytes": 31
+    },
+    {
+      "path": "src/cgroup.rs",
+      "sha256": "396299ba8fed350072e4df2e142f5414cdd213976e7058445eae4a4db8b710b8",
+      "bytes": 6307
+    },
+    {
+      "path": "src/engine/expr.rs",
+      "sha256": "348080c676325ceb5f8de9ff83ac106a5a36989e79d6e21e6686f6ccf249e57e",
+      "bytes": 14092
+    },
+    {
+      "path": "src/engine/ivf.rs",
+      "sha256": "9f6c90d86f13447b51419a70a87fafa1d0e6891ce4d24f1cda053e995e45c0fd",
+      "bytes": 8645
+    },
+    {
+      "path": "src/engine/mod.rs",
+      "sha256": "7e3d9345c324b02f9d6cbc0bf69ab6980828e6568190729d25be793fe11b7533",
+      "bytes": 36606
+    },
+    {
+      "path": "src/engine/query.rs",
+      "sha256": "e94233fb1b4c316a4d4f476fa6d6fc854b357c47e1ba479c9ff5570045e944c7",
+      "bytes": 16485
+    },
+    {
+      "path": "src/engine/result.rs",
+      "sha256": "c4ee68a222b8073fc6d3994deaa7daaa3df2098d15e0882441495156cc583cb5",
+      "bytes": 3229
+    },
+    {
+      "path": "src/engine/sq8.rs",
+      "sha256": "b3052283aaeb25f7c9c63566bee3c31d18c737ade9adeb21b2f4433a6da4ca8b",
+      "bytes": 11301
+    },
+    {
+      "path": "src/engine/table.rs",
+      "sha256": "e72580d9a6398ebc225e0e4a2624f02c89b0564594c7e2852a550c2814f853bc",
+      "bytes": 44421
+    },
+    {
+      "path": "src/engine/topk.rs",
+      "sha256": "1daca231c5e22b077ca31456acb2cd7d2ed0b411af605fb5477490d5ef4c77a7",
+      "bytes": 5569
+    },
+    {
+      "path": "src/engine/txn.rs",
+      "sha256": "7e65ce8497b58e0c4b44d835a1eee62e980b224e1e951302f1f12a2b3e44da68",
+      "bytes": 1804
+    },
+    {
+      "path": "src/error.rs",
+      "sha256": "8ee6d6ddc374a38224b5889b1fe4abcfdf64e8f6954e5ecdcc9f7f669a128bc2",
+      "bytes": 2890
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "12c075719f27db9bcbef08433c2810f82d68d65e69e514be7c8e0e972ab64085",
+      "bytes": 126
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "1e5b920b40d451323f2c17aad22d7bd93075def9eb5acf8dfa00e282477be5c7",
+      "bytes": 8447
+    },
+    {
+      "path": "src/protocol.rs",
+      "sha256": "848e4a074d3ebaf6538dbfc9783c264a43e4a0409ae0aeaae7413edd76c88f9a",
+      "bytes": 21343
+    },
+    {
+      "path": "src/sql/ast.rs",
+      "sha256": "ee097812f480cd0c23d4068af36066df60fa8f4f525bef37679b5c32316add98",
+      "bytes": 2747
+    },
+    {
+      "path": "src/sql/lexer.rs",
+      "sha256": "91b05532baead74cce4094920ac12b4156731ea9cc00540c291a64e1a59bff5a",
+      "bytes": 10712
+    },
+    {
+      "path": "src/sql/mod.rs",
+      "sha256": "f63672298f39584ba3d85e690b5eb113d47f811c5730b513b4d6c2780aea4163",
+      "bytes": 68
+    },
+    {
+      "path": "src/sql/parser.rs",
+      "sha256": "90d6433213c84747de35cc57975d3ad3fa11dcc9dd4b2ed33fcbc4b99572102b",
+      "bytes": 35693
+    },
+    {
+      "path": "src/storage/catalog.rs",
+      "sha256": "d5da2fa6a01285f5f7849f535282e8983d2ce80153929cb5df1b5ed576550c4c",
+      "bytes": 2473
+    },
+    {
+      "path": "src/storage/codec.rs",
+      "sha256": "83d0dd598cb69593b96175bc515c60c516db69faed3335166725ad3ae0c48069",
+      "bytes": 3570
+    },
+    {
+      "path": "src/storage/crc.rs",
+      "sha256": "d5b4c7d41f2e4a9a0a06827648a152685aa12686c673efa1f8630f91ec86844f",
+      "bytes": 3048
+    },
+    {
+      "path": "src/storage/log.rs",
+      "sha256": "264e51d46f7f975238b6676c46072a4db045053e009b383d9c01bdec760a569c",
+      "bytes": 42979
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "sha256": "1e3d17bc9479c2593635ae29240e5c2d4f363a784cb7ad60e8e2691935fc491f",
+      "bytes": 211
+    },
+    {
+      "path": "src/storage/row.rs",
+      "sha256": "649849e4b19665d7dae28c33a13679e3c893aa1a9417ccdbaa14070fad8bc09b",
+      "bytes": 3648
+    },
+    {
+      "path": "src/types.rs",
+      "sha256": "801ad2e6b1733f52749fcb1896658bf4f070651ab0355e27c6a3f9a4bf5deb26",
+      "bytes": 9574
+    },
+    {
+      "path": "src/vector.rs",
+      "sha256": "02f11f3f0fc72c8c20f066f1e60233ee26eff58985f623bf5ae5b08bdc7ec9bb",
+      "bytes": 13767
+    }
+  ],
+  "manifest_scope": "Pinned third-party source identity, not the final enclosing submission commit. Source/build bytes are unchanged; learning materials are replaced by authentic current-user records."
+}
