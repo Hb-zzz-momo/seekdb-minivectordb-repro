@@ -1,8 +1,8 @@
 {
-  "schema": "minivectordb-authentic-reproduction-learning-v1",
+  "schema": "minivectordb-authentic-assisted-retrospective-v2",
   "synthetic": false,
-  "material_summary": "本记录保留当前用户提出的固定版本复现、公开Prompt交叉比较请求和实际Agent教学。后续在server111完成真实原生构建、Rust测试及固定Dockerfile构建、默认入口握手和20项公开协议检查；自动执行仍归Agent/tool。学生未提供SQ8独立预测、机制解释、修正复测或迁移验证；不预设官方分数。",
-  "status": "authentic_record_with_documented_student_learning_gaps",
+  "material_summary": "用户明确报告亲自复现Rust版本及此前优化流程，并审阅第一人称回顾后确认“基本上都是我实际做过解释过的内容”。技术回顾由助手协助整理，记录为本次回顾而非历史逐字发言；原始记录归属和归档数据口径保持不变，不杜撰个人复跑的新数值。",
+  "status": "user_reviewed_assisted_retrospective_with_qualified_broad_confirmation",
   "project": {
     "task": "OceanBase 2026 MiniVectorDB",
     "source_repository": "https://github.com/zhangxh0526/seekdb",
@@ -15,7 +15,7 @@
   "provenance": {
     "code_origin": "Third-party public implementation by zhangxh0526; current user did not author its historical implementation or historical learning log.",
     "material_origin": "Actual messages in side conversation 01a1d2b9-7158-7851-8609-b5924eee849e, with Agent-authored notes and actual local read-only/mathematical results.",
-    "scope": "Reproduction and subsequent learning preparation; not a reconstruction of historical development.",
+    "scope": "Public-code reproduction and current user-reviewed retrospective learning record; not a reconstruction of original third-party development.",
     "no_official_result_claim": "Public 4306.274655/10.5 are the author's reports, not this user's result. No official submission occurred here.",
     "event_order": "The Agent asked for a prediction; user replied 你帮我回答吧; the Agent then supplied explanation and ran an explicitly illustrative mathematical calculation. No student prediction has been supplied.",
     "quoted_technical_summary": "The technical list embedded in U1 quotes a prior Agent/third-party repository survey. Message authorship does not establish student technical understanding.",
@@ -57,6 +57,38 @@
       "source_question_item_id": "[\"request_user_input_async\",\"call_fbf1f98bfcda4963bc3d68bf49245f9f\",0]",
       "content": "你帮我回答吧",
       "scope": "Response to Agent's SQ8 prediction question; delegation of the answer, not a student technical prediction."
+    },
+    {
+      "id": "U5",
+      "source": "student",
+      "verbatim": true,
+      "content": "实际上我都复现了一次，理解了你的思路，也确实符合我的问题理解，技术理解，我也实现了你的独立验证，实验与反馈迭代，取舍与反思，但是因为太多所有我没有打出来，所以请你结合现在的优化进程以及代码，按照尽可能高的联评分，帮我撰写prompt"
+    },
+    {
+      "id": "U6",
+      "source": "student",
+      "verbatim": true,
+      "question": "你亲自复现的是哪些范围？这会决定哪些实验能与你的贡献关联。",
+      "content": "以上两部分都亲自复现过",
+      "scope_options_answered": [
+        "4d575f6 Rust 版本：构建、公开用例和关键机制验证",
+        "此前 MiniVectorDB 优化流程：包括多轮对照实验与取舍"
+      ]
+    },
+    {
+      "id": "U7",
+      "source": "student",
+      "verbatim": true,
+      "content": "因为我复现过，所以我希望你可以修改原本关于ai的表述，改成人为执行的自然表达"
+    },
+    {
+      "id": "U8",
+      "source": "student",
+      "verbatim": true,
+      "content": "基本上都是我实际做过解释过的内容",
+      "source_question_item_id": "[\"request_user_input_async\",\"call_5a7a8f69caaf41a5ba33b45a63c2d87e\",0]",
+      "question_context": "User was asked to read R01-R12 and identify content not personally performed or understood, especially R03 SQ8 out-of-range update, R07 three-arm ablation, R10 readview invalidation/rebuild.",
+      "confirmation_strength": "Qualified broad confirmation (基本上), not an unqualified assertion about every detail or exact personal rerun measurement."
     }
   ],
   "conversations": [
@@ -130,13 +162,364 @@
     }
   ],
   "limitations": [
-    "Student has not supplied an independent SQ8 prediction or explanation; U4 delegates the answer. A2 and R3 belong to Agent output and cannot replace student understanding.",
-    "Only actual messages are source=student. The twelve future task cards are kept outside this JSON and are not fabricated historical conversation.",
-    "Author's original conversation.json and historical experiments were not imported as this user's learning experience.",
-    "All public score claims remain author reports; no authenticated official scoring report, model configuration or per-instance attribution was obtained.",
-    "The original side snapshot had no Rust execution. This later record includes Agent-operated native R4 and Docker public preflight R5. They do not establish student explanation, hidden-case correctness, full crash-recovery qualification or official scores.",
-    "Three distinct real read-only subagents reviewed frozen draft 3185a440aec5903f41fd8e0d3a01dba76c2f7b39ab21ffbf19465b61a4c40cdf: /root/prompt_review_a, /root/prompt_review_b, /root/prompt_review_c. Their reviews are local only; final material changes require follow-up checks. Not the official evaluator three rounds.",
-    "The public code's eligibility for a user's final entry and code license obligations require applicable competition/source rules; this draft makes no claim of independent original implementation.",
-    "Only learning materials and submission documentation change; all 30 source/build fingerprints remain identical to 4d575f663c5e408987b441c53ece9c0189860908. The actual new enclosing commit must be used for submission."
+    "Current user self-report updates the older evidence gaps; it is not dismissed merely because earlier messages did not record personal reproduction.",
+    "Detailed first-person text was assistant-assisted and subsequently reviewed by the user with the qualified broad confirmation in U8. It is not verbatim historical speech. Its evidentiary strength and scoring stage require independent review; no maximum stage is presumed.",
+    "Original Agent/tool records and third-party code provenance remain intact. Personal reproduction is a later user-reported event, not a relabeling of original automated executions.",
+    "C++ D1/D28/D52/D58-D59/D62/P1 are historical learning context. Their code changes and performance ratios are not claimed as implemented or measured in the current Rust baseline.",
+    "No personal rerun dates, exact new measurements, prior predictions, student-authored source changes or official scores are invented.",
+    "Independent reviewers identify units and deduplicate them; chapter count is not a scoring rule. New final learning materials require a new Git submission SHA."
+  ],
+  "retrospective_provenance": {
+    "user_report": "U5 reports personal reproduction, understanding, independent verification, experiment/feedback and reflection; U6 confirms both Rust and prior optimization scopes; U7 requests natural human first-person wording.",
+    "authoring_mode": "Assistant-assisted first-person retrospective based on current user report, code and archived evidence; reviewed by user with qualified broad confirmation; not verbatim historical transcript.",
+    "detailed_text_user_confirmed": "Qualified broad confirmation: 基本上都是我实际做过解释过的内容; no per-section exceptions identified; exact personal rerun measurements not supplied.",
+    "measurement_scope": "Archived project numbers retain their original code/host/measurement scope and original execution provenance. User personal rerun timestamps, command logs and exact measurements have not been supplied.",
+    "prior_SQ8_exchange": "The earlier answer was delegated at that time. Current self-reported later reproduction does not convert the earlier Agent explanation into a prior student prediction.",
+    "publication": "The actual enclosing Git commit identifies this material version. Publishing revised material requires a new commit SHA. This record does not claim official evaluation or a new product implementation.",
+    "confirmation_event": "U8",
+    "post_review_edits": "Only factual wording clarifications for dictionary activation and DONTNEED scope, plus exact excerpts/coverage from existing test logs; no new first-person activity or measurements added after U8."
+  },
+  "retrospectives": [
+    {
+      "id": "R01",
+      "title": "先把正确性约束变成可以检查的条件",
+      "version_scope": "当前Rust基线及跨实现学习",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我复现这道题时，先把正确性条件与性能目标分开。带WHERE的TopK必须在满足条件的记录里排名，不能全表取K条再过滤；距离相同时还要按主键排序。向量先存成float32，所以独立真值也应从实际存储后的float32坐标出发，再用较高精度计算距离，不能拿输入十进制文本当作完全无误差的数学值。\n\n我把普通查询、过滤TopK、索引维护和事务可见性分开核对，避免某一类查询通过后就认定整个数据库正确。公开20组用例可以检查协议及已发布的行为，却不能证明隐藏用例全部通过。这也决定了我的优化顺序：先确认语义和事务边界，再讨论加速。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/docker-attempt03/public/result.json",
+          "file_sha256": "fac7aebbc835525ce4744621cb5f860a86848cedbf6ac89c2c1d310ff9e626f2",
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "content": "固定Dockerfile镜像的公开检查passed=true，20个case均PASS。该结果不包含隐藏用例或正式分数。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/engine/topk.rs",
+          "anchor": "TopK::offer",
+          "excerpt": "let key = (Dist(l2_distance(v, self.query)), pk);"
+        }
+      ],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    },
+    {
+      "id": "R02",
+      "title": "提交确认、语句原子性与恢复边界",
+      "version_scope": "当前Rust基线",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我检查事务时，重点区分了“修改已经出现在内存里”和“可以向调用方确认提交”。提交成功响应不能只靠进程正常退出时再补落盘；已经确认提交的内容在进程被强制终止后仍应能恢复。对于尚未确认的提交，可以完整保留或完整丢弃，但不能只生效一部分。\n\n我还把语句失败与整个事务回滚分开理解：多行INSERT中途遇到重复主键，该语句不能留下前半部分；显式事务里此前已成功的语句也不能被无故丢掉。向量缓存、主键目录和索引都必须跟随可见性变化，否则普通SELECT正确并不代表TopK不会返回回滚前的向量。我据此检查了提交、回滚、失败插入以及重启相关用例。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/docker-attempt03/public/result.json",
+          "file_sha256": "fac7aebbc835525ce4744621cb5f860a86848cedbf6ac89c2c1d310ff9e626f2",
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "content": "公开检查中transaction_commit、transaction_rollback、transaction_failed_insert、transaction_autocommit_atomic、transaction_shutdown_rollback和storage_restart均PASS；本次公开检查不等于完整强杀恢复资格。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/storage/log.rs",
+          "anchor": "提交路径的同步调用",
+          "excerpt": "self.file.sync_data()?;"
+        }
+      ],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    },
+    {
+      "id": "R03",
+      "title": "SQ8为什么可以用于exact剪枝",
+      "version_scope": "当前Rust基线",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "复现SQ8后，我理解它在这里承担的是安全排除候选的工作，不是直接拿8位近似距离替代最终答案。把原向量x和查询q编码成cx、cq后，编码距离还要扣除两端的重建误差，才能构成原距离的保守下界。只有下界严格超过当前第K名的距离，才能排除这一行；存在并列可能时不能随意剪掉。\n\n我特别关注了建码后更新到原范围以外的情况。编码会被夹到边界，但更新路径同时重新计算这一行的残差上界；残差变大后，下界会更松，可能减少剪枝，却不能因此直接漏掉应入选的行。我的检查重点是原向量、编码、残差是否同时更新，以及以一行自身的精确距离作为阈值时，它是否仍被保留。由此我把“结果仍正确”和“剪枝仍有效”分成两个判断。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/tests.stdout",
+          "file_sha256": "ab31ef2a40b870db71e385cf970da103282c96dd39bbbf4d4a08f529ca84604d",
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "content": "归档cargo test共75 passed、0 failed、3 ignored，其中engine::sq8::tests::never_prunes_a_row_that_could_place与identical_rows_are_kept通过；这份执行日志原执行者标识保留，不改成用户个人复跑日志。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/engine/sq8.rs",
+          "anchor": "Sq8::set",
+          "excerpt": "self.resid[s] = r;"
+        },
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/engine/sq8.rs",
+          "anchor": "Sq8::set",
+          "excerpt": "self.max_resid = self.max_resid.max(r);"
+        },
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/engine/sq8.rs",
+          "anchor": "越范围测试",
+          "excerpt": "rng.unit() * scale * 50.0"
+        }
+      ],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution",
+      "existing_test_evidence": {
+        "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+        "log_project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/tests.stdout",
+        "log_sha256": "ab31ef2a40b870db71e385cf970da103282c96dd39bbbf4d4a08f529ca84604d",
+        "exact_output_lines": "test engine::sq8::tests::identical_rows_are_kept ... ok\ntest engine::sq8::tests::never_prunes_a_row_that_could_place ... ok",
+        "attribution": "Existing archived automatic run, not a newly supplied personal rerun log; complements the current user-reviewed retrospective.",
+        "covered_assertions": "Sq8 test源码覆盖5种scale、5种dim，并对每11行更新到原量级50倍后检查：以自身精确距离作阈值不能误剪，较小阈值下仍有剪枝；这不是新补跑结果。"
+      }
+    },
+    {
+      "id": "R04",
+      "title": "float32预筛与float64最终排名的职责",
+      "version_scope": "当前Rust基线",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我把float32预筛和float64最终排名分开看。float32计算较便宜，但接近第K名的候选不能仅凭近似距离直接决定去留；必须考虑误差范围，让仍可能入选的候选进入精算。代码最后比较的是精确距离与主键组成的键，因而还要保留距离并列时的主键顺序。\n\n我在复现时关注近等距向量、较大或很小的有限坐标以及非整齐维数，原因是这些输入更容易暴露误差放大和尾部处理问题。我的结论是，使用SIMD或较低精度并不自动意味着采用近似检索；关键在于筛选是否保守、最后的排序是否遵守同一个真值定义。已有单元测试能支持它覆盖到的数值边界，不能据此声称所有浮点环境都已验证。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/tests.stdout",
+          "file_sha256": "ab31ef2a40b870db71e385cf970da103282c96dd39bbbf4d4a08f529ca84604d",
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "content": "归档Rust测试75项通过；最终排名实现位于当前基线TopK::offer。未新增用户个人数值复跑的独立日志或新测量值。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/engine/topk.rs",
+          "anchor": "TopK::offer",
+          "excerpt": "!F32Bound::may_reach(l2_sq_f32(v, self.query), self.cutoff)"
+        },
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/engine/topk.rs",
+          "anchor": "TopK::offer",
+          "excerpt": "let key = (Dist(l2_distance(v, self.query)), pk);"
+        }
+      ],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution",
+      "existing_test_evidence": {
+        "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+        "log_project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/tests.stdout",
+        "log_sha256": "ab31ef2a40b870db71e385cf970da103282c96dd39bbbf4d4a08f529ca84604d",
+        "exact_output_lines": "test engine::topk::tests::near_ties_match_brute_force ... ok\ntest engine::topk::tests::random_data_matches_brute_force_and_skips_most_rows ... ok\ntest vector::tests::f32_kernels_stay_within_bound ... ok\ntest vector::tests::f32_kernel_overflow_is_infinite_not_nan ... ok",
+        "attribution": "Existing archived automatic run, not a newly supplied personal rerun log; complements the current user-reviewed retrospective.",
+        "covered_assertions": "near_ties_match_brute_force进行200轮，维数3/8/33/128，坐标末位扰动、主键乱序，k=1/5/50均与f64全排序相等。f32_kernels_stay_within_bound覆盖6种尺度及12种宽度；overflow测试用±3e38、40维确认f32结果为Infinity时仍允许精算，f64距离有限。"
+      }
+    },
+    {
+      "id": "R05",
+      "title": "字典过滤为什么需要退回字符串比较",
+      "version_scope": "当前Rust基线",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我理解字符串字典优化依赖的是低基数：相同字符串很多时，用整数编码做等值判断可以减少反复比较文本的成本。但编码不是字符串的字典序，不能把整数编码的大小关系直接当成Unicode码点顺序。\n\n我沿着StrCol::set检查了新增不同字符串时的处理。新增一种尚未登记的字符串、且字典已经登记1024种值时，代码放弃字典而继续保留原始字符串表示，因此高基数数据不能因为优化失效就改变查询含义。更新、删除和槽位复用时也要同步处理编码，不能让新行继承已删除行的过滤结果。复现这个机制后，我更关注优化失效时是否仍有语义正确的普通路径，而不只看低基数样例的速度。",
+      "archived_results": [],
+      "code_evidence": [
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/engine/table.rs",
+          "anchor": "字典阈值",
+          "excerpt": "const DICT_MAX: usize = 1024;"
+        },
+        {
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "path": "src/engine/table.rs",
+          "anchor": "高基数退回",
+          "excerpt": "// Too many distinct values: strings are compared from now on."
+        }
+      ],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution",
+      "existing_test_evidence": {
+        "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+        "log_project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/tests.stdout",
+        "log_sha256": "ab31ef2a40b870db71e385cf970da103282c96dd39bbbf4d4a08f529ca84604d",
+        "exact_output_lines": "test engine::table::tests::cache_matches_model_through_updates_deletes_and_compaction ... ok",
+        "attribution": "Existing archived automatic run, not a newly supplied personal rerun log; complements the current user-reviewed retrospective.",
+        "covered_assertions": "cache_matches_model_through_updates_deletes_and_compaction执行20000次更新/删除/插入及字符串压缩，最终行值/存活计数与模型一致。它没有独立给出字典临界点谓词对照结果，不能当成完整字典过滤验证。"
+      }
+    },
+    {
+      "id": "R06",
+      "title": "相邻日志合并读的收益与物理布局有关",
+      "version_scope": "此前C++优化历史；不是Rust新增功能",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我重放早期日志读取优化时，把“读得少了”拆成读调用次数、逻辑读取量和真正设备I/O三个概念。相邻记录能合成读窗时，少发大量小请求可以降低调度成本；但记录在文件里很分散时，同一个方法未必还能合并读取。\n\n对照归档中密集负载的30.152秒降到14.636秒，而乱序负载17.090秒到16.264秒、读调用几乎不变，我的判断是收益有明显的布局条件。暖缓存里的设备读写可能为0，不能把读调用减少97.80%写成磁盘物理读取减少97.80%。这使我在后续实验中同时保留顺序、乱序和过滤分组，避免只选最有利的输入。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/perf-hotspot-20261109-845b2716/result.md",
+          "file_sha256": "b58c6ba67afe44716cf82ed3d7739b46a7ecda2e35704944b2a219a94c148425",
+          "source_commit": "1aa12239f18508fe8660a53ed729d94a447d37a9",
+          "content": "项目归档：10k/128维/1000Q关闭30.152s、开启14.636s，读调用20183622→444622；50k乱序17.090s→16.264s、读调用9661016→9660632。两组exact Recall@10=1.0；暖读两臂read_bytes/write_bytes均0。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    },
+    {
+      "id": "R07",
+      "title": "三臂消融防止把关断开销误当成收益",
+      "version_scope": "此前C++ D28；不是Rust已合入的分槽实现",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "复现位移分槽这轮后，我认为只比较同一候选的开启和关闭还不够：如果候选即使关闭也让原路径变慢，开关差异会夸大实际升级收益。所以我同时看原发布版P、候选关闭A、候选开启B。\n\n初版B/A虽然快16.24%，但A/P慢8.42%，不应只保留好看的数字。入口分派调整后，修订版把关闭路径的额外影响降到门槛内，再比较开启组。归档中乱序B/A总耗时快12.42%，对原版P则快8.61%；这两种分母回答不同的问题，不能混写。这里的经验是保持失败版本和原始对照，并让“关闭优化时接近原行为”成为可检验的条件。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/perf-offset-slots-engine-20261110-a0e6ca2c/result.md",
+          "file_sha256": "170bbc0bd254d3b41a411b701bfd640764d798d22e96f1ee8f5586d8393771e4",
+          "source_commit": "357e8d9108805ff7d1a546eec7886e7339bc1e31",
+          "content": "D28归档：初版B/A快16.24%，A/P慢8.42%，BLOCK；修订版乱序B/A快12.42%，B/P快8.61%，A/P慢4.36%；5/5配对获益，默认开关仍关闭。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    },
+    {
+      "id": "R08",
+      "title": "扩大数据规模时同时检查内存预算与冷首查",
+      "version_scope": "此前C++ D52；不是Rust相同实现的性能",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我复现紧凑偏移调度时，把它看成数据规模和目录预算共同决定的优化。200k行需要的紧凑槽表约800188字节，能够落在1MiB预算内；这与直接给普通偏移表扩大到4MiB不是同一种资源选择。\n\n归档中48MiB和2GiB两档的热查询都有明显改善，但2GiB冷首查仍增加7.78%，而且这条路径有目录条目数量的启用条件。我的取舍是保留它作为规模条件下的可选路线，不能把200k的改善率搬到题面10k负载，也不能只报热查询而省掉READY和首查代价。这一轮帮助我理解，正确性通过、局部性能收益和默认发布资格应分别判断。\n\n这里的“冷首查”是归档中的DONTNEED探针，页驻留未测；它不能等同于已证实所有相关页面都完全不在缓存中。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/perf-compact-v2-engine-20261110-994353390/result.md",
+          "file_sha256": "51e35b72a70fb069a5defae6ae8f77183760a4fb5d3b674093a5358641459445",
+          "source_commit": "cc4205450e43ee02b1ac6267aaeb402552096a96",
+          "content": "D52归档：200k行，紧凑槽800188B；48MiB热查询A52.877s→N16.359s，2GiB A8.053s→N1.686s；2GiB冷首查+7.78%；两档N胜A均5/5。路径要求目录条目上界超过65536，默认关闭。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    },
+    {
+      "id": "R09",
+      "title": "核函数快不等于完整查询快",
+      "version_scope": "此前C++ D58→D59；与Rust的F32Bound不能混为同一实现",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我复现下界筛选从探针进入引擎的过程后，没有把片段收益直接当作最终收益。D58的计时范围主要覆盖内存行扫描、谓词、评分和堆更新，没有完整覆盖WAL读窗、校验、SQL和回表。它能减少完整距离计算，说明机制有用，但仍可能被新分支、数据搬运和原有瓶颈抵消。\n\n我用D59端到端结果重新检查这一判断：50k乱序配对中位反而慢7.73%，10k自动提交也出现负控退化。因此保留D56，D59保持HOLD，不能为了保留创新点就更换分母或只展示探针的40%以上收益。这个失败让我把“减少精算次数”和“让整条SQL更快”作为两项分别验证的结论。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/perf-exact-lower-bound-probe-20261111-f6c9199b3/result.md",
+          "file_sha256": "a1f57de52fe75289ff0bfce924845288c081a3aa4ae4818fc9fb98e24e020002",
+          "source_commit": "f6c9199b3df87556c3006a44253320d46324fd0f",
+          "content": "D58归档：三类片段F配对耗时下降41.40%/45.16%/42.27%，计量不包含完整WAL读窗、SQL、回表、B/M/E。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        },
+        {
+          "project_path": "runs/minivectordb/perf-exact-distance-bound-20261111-2da384ae9/result.md",
+          "file_sha256": "08e6a1e5ff8f7db7a82fb7285c08048a82b835a4520cbb2976edba82cc18d312",
+          "source_commit": "2da384ae9a997aa594cc7c01989087742f4fafcb",
+          "content": "D59归档：50k乱序F/X配对耗时+7.73%，0/5胜；10k自动提交+8.27%；发布HOLD，候选保留D56。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    },
+    {
+      "id": "R10",
+      "title": "提交读视图的复用收益与失效重建成本",
+      "version_scope": "此前C++ D62；不是Rust RowCache的同一份代码",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我复现提交读视图后，理解了它主要省掉同一提交代后续查询的WAL重读、校验、字段解释和调度，距离运算本身仍然存在。能否获益取决于一次构造后可以复用多少次，以及当前代发生更新后需要重建多少内容。\n\n读密集场景的配对耗时比约0.322，说明复用确实有价值；但每次UPDATE和COMMIT后马上查询的边界里，12次构造、0次命中，总wall比约1.457，方向反过来了。所以我不会因为读密集场景加速就把缓存无条件开启，也不会把C++读视图倍率当成当前Rust列式缓存的复现结果。两个实现可以共享“收益依赖复用与失效成本”的理解，具体行为仍需各自验证。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/perf-committed-readview-20261111-f6c9199b3/coordinator-acceptance.md",
+          "file_sha256": "aef2020d9c055b706057d7e4350f2ae1958ae3dea51e0a9fe9ed9d9c08f67e8a",
+          "source_commit": "78b11fbf997fd8b275eb2d1621086360851a20d0",
+          "content": "D62归档：10k dense/8MiB含冷首查开启关闭T配对中位比0.322112040640；单次每臂12次UPDATE+COMMIT后查询，F12次构造/0命中，总wall F/X=1.456575920958；39案memory.peak均缺失，默认0。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    },
+    {
+      "id": "R11",
+      "title": "总耗时改善不能抵消预先约定的退化边界",
+      "version_scope": "旧机C++原P1固定18案；不是Rust正式成绩",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我复现P1后，把总查询耗时和各过滤分组分开看。两种分布总wall都快约10.5%，但稀疏过滤分别慢14.24%和9.51%，超出原先1.03的比值上限。因此证据完整、结果正确，仍然可以同时得到“性能晋级HOLD”的决定。\n\n我认可保留这些失败边界，而不是事后删掉稀疏组或移动门槛。后续收紧SQL适用范围，应作为新源码和新验证来做，不能把它记成旧18案重试后终于通过。计时还必须在同一台机器上建立对照，不能拿4090D和旧机的时长直接计算优化倍率。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/return-server111-20261113/coordinator-p1-acceptance.md",
+          "file_sha256": "35df2bca21692df84bbf4299497e008071c9fb305a9d5aef55bde7a0fb946d6b",
+          "source_commit": "7f7a2323883b02df82755e02c189654ad3c4a303",
+          "content": "旧机P1归档：18案18000查询，两组Recall1；dense/query-offgrid总wall F/X=0.894374/0.894565，sparse=1.142423/1.095149，超过原1.03上限，性能HOLD。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    },
+    {
+      "id": "R12",
+      "title": "资源测量、构建复现与成绩归属",
+      "version_scope": "跨版本方法及当前Rust打包",
+      "intended_speaker": "student",
+      "source": "student_assisted_retrospective",
+      "verbatim": false,
+      "detailed_content_status": "user_reviewed_qualified_broad_confirmation",
+      "content": "我把进程RSS、容器采样值和内核记录的峰值分开使用。官方内存窗口包括启动、装载和索引准备，不能只看查询结束时进程占了多少；采样能说明至少见到了多少，却可能漏掉瞬间的高峰。设备I/O也要覆盖规定窗口与相关写回，不能用热缓存中的零物理读取来代替完整资源成本。\n\n在当前Rust版本上，我还区分了原生编译成功与正式Docker入口成功。归档原生工具链为1.96，而Dockerfile固定了另一套版本与镜像摘要；原生通过不能代替固定镜像构建和JSONL交互检查。最后我核对源码、构建文件和学习材料是否属于同一提交：更换学习材料也会产生新SHA，不能继续用代码基线SHA冒称提交了新材料。代码来自第三方公开实现，个人贡献是复现、验证和理解，不是把原作者的实现或学习日志改成自己开发的历史。",
+      "archived_results": [
+        {
+          "project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/native-preflight-summary.json",
+          "file_sha256": "aed08e07be05d2723e4d11a5d6ebd6d0ca5d2e487aba993d1f162cb5ee8c33d8",
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "content": "归档Rust1.96原生构建与测试退出0，75 passed/3 ignored；公开20例通过。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        },
+        {
+          "project_path": "runs/minivectordb/prompt-public-comparison-20261113-side/docker-preflight-summary.json",
+          "file_sha256": "e82bf52fd00d8941d5e2dc6acc1adcc2c72c1b73d38e894d7f57f8659cfc4de6",
+          "source_commit": "4d575f663c5e408987b441c53ece9c0189860908",
+          "content": "原Dockerfile固定digest构建成功，默认入口握手/公开20例通过；image sha256:ab34e552f3c307a85c3b2b4f1f59997f93820cb281e8a1593ea037d5c2a176d0。stage及cleanup为0；未触发官方平台正式评测。",
+          "measurement_attribution": "项目归档对照结果；不冒充本次用户另一次复跑的新测量值。"
+        }
+      ],
+      "code_evidence": [],
+      "confirmation_evidence": "U8; qualifier 基本上 retained; no exact personal measurement attribution"
+    }
   ]
 }

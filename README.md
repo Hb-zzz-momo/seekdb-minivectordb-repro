@@ -4,7 +4,7 @@ Database source: [zhangxh0526/seekdb](https://github.com/zhangxh0526/seekdb/tree
 
 The database implementation is third-party public code, not newly authored by the current participant. All 30 source/build files, including Dockerfile and the Rust toolchain pin, retain the original bytes. `agent/source-baseline-manifest.json` records their SHA-256 fingerprints.
 
-`agent/conversation.json` contains the current participant's authentic requests, Agent explanations and actual tool-result summaries, with roles and limitations. The original author's learning logs are not used as the current participant's experience. The historical author logs remain available through the original source commit. Agent explanations, automatic tests and local reviews do not establish student understanding or an official score.
+`agent/conversation.json` includes the participant's authentic requests and user-reviewed first-person reproduction retrospectives, alongside original explanations and tool-result summaries. The participant reported personally reproducing both the Rust baseline and prior optimization work, then reviewed the assisted retrospective wording with a qualified broad confirmation. These are current retrospective accounts, not fabricated verbatim historical messages; archived measurements retain their original scope and execution provenance. The original author's learning logs are not used as the current participant's experience. The historical author logs remain available through the original source commit. The reviewed retrospective records the participant's learning account; original automatic logs and local reviews retain their separate provenance and do not establish an official score.
 
 ## Build and public preflight
 
